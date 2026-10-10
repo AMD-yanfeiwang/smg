@@ -673,6 +673,7 @@ impl ConfigValidator {
             }
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
+                ..
             } => {
                 if *load_check_interval_secs == 0 {
                     return Err(ConfigError::InvalidValue {
@@ -2434,6 +2435,7 @@ mod tests {
             },
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             },
         );
 
@@ -2472,6 +2474,7 @@ mod tests {
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback
@@ -2492,6 +2495,7 @@ mod tests {
                 ],
                 prefill_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }), // Requires 2+ workers
                 decode_policy: None,
             },
@@ -2527,6 +2531,7 @@ mod tests {
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
                     load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback

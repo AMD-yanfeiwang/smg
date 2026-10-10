@@ -897,6 +897,31 @@ pub enum CacheIndexKind {
     Hash,
 }
 
+/// What `power_of_two` compares its candidates by.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerOfTwoLoadMetric {
+    /// Least-load expected wait of two random workers.
+    #[default]
+    ExpectedWait,
+    /// Router in-flight requests of two random workers, then expected wait.
+    Requests,
+    /// Router in-flight requests of every healthy worker, then expected wait.
+    LeastRequests,
+}
+
+impl PowerOfTwoLoadMetric {
+    /// Parse the CLI spelling (`expected_wait` / `requests` / `least_requests`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "expected_wait" => Some(Self::ExpectedWait),
+            "requests" => Some(Self::Requests),
+            "least_requests" => Some(Self::LeastRequests),
+            _ => None,
+        }
+    }
+}
+
 /// Policy configuration for routing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -981,7 +1006,11 @@ pub enum PolicyConfig {
     /// but WorkerMonitor does not yet use per-policy intervals. This field is reserved for
     /// future support of different polling cadences per policy.
     #[serde(rename = "power_of_two")]
-    PowerOfTwo { load_check_interval_secs: u64 },
+    PowerOfTwo {
+        load_check_interval_secs: u64,
+        #[serde(default)]
+        load_metric: PowerOfTwoLoadMetric,
+    },
 
     /// Least-(token-)work policy: routes to the worker minimizing the expected
     /// wait `(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`
@@ -2193,6 +2222,7 @@ mod tests {
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
+            load_metric: Default::default(),
         };
         assert_eq!(power_of_two.name(), "power_of_two");
     }
@@ -2227,6 +2257,7 @@ mod tests {
 
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 60,
+            load_metric: Default::default(),
         };
         let json = serde_json::to_string(&power_of_two).unwrap();
         assert!(json.contains("\"type\":\"power_of_two\""));
@@ -2381,11 +2412,13 @@ mod tests {
     fn test_power_of_two_parameters() {
         let power_of_two = PolicyConfig::PowerOfTwo {
             load_check_interval_secs: 120,
+            load_metric: Default::default(),
         };
 
         match power_of_two {
             PolicyConfig::PowerOfTwo {
                 load_check_interval_secs,
+                ..
             } => {
                 assert_eq!(load_check_interval_secs, 120);
             }
@@ -2939,6 +2972,7 @@ discovery:
             }),
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             }),
         };
 
@@ -3001,6 +3035,7 @@ discovery:
             prefill_policy: None,
             decode_policy: Some(PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 60,
+                load_metric: Default::default(),
             }),
         };
 
