@@ -61,6 +61,7 @@ impl ResponseProcessor {
     #[expect(clippy::too_many_arguments)]
     pub async fn process_single_choice(
         &self,
+        request_id: &str,
         complete: &ProtoGenerateComplete,
         index: usize,
         original_request: &ChatResponseSpec,
@@ -106,11 +107,11 @@ impl ResponseProcessor {
 
         // Complete token decoding, including bytes and a partial stop match.
         // The last token takes the tail so the token spans reach the text end.
-        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
-            stop_decoder
-                .finish()
-                .map_err(|e| format!("Failed to finish token decoding: {e}"))?
-        {
+        let tail = stop_decoder
+            .finish()
+            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
+        utils::warn_detokenize_recoveries(request_id, index as u32, stop_decoder);
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
@@ -329,6 +330,7 @@ impl ResponseProcessor {
         for (index, complete) in all_responses.iter().enumerate() {
             match self
                 .process_single_choice(
+                    &dispatch.request_id,
                     complete,
                     index,
                     &chat_request,
@@ -488,6 +490,7 @@ impl ResponseProcessor {
                     format!("Failed to finish token decoding: {e}"),
                 )
             })?;
+            utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
             let stopped_at_finish = matches!(
                 tail,
                 SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
@@ -690,14 +693,14 @@ impl ResponseProcessor {
                 break;
             }
         }
-        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
-            stop_decoder.finish().map_err(|e| {
-                error::internal_error(
-                    "process_tokens_failed",
-                    format!("Failed to finish token decoding: {e}"),
-                )
-            })?
-        {
+        let tail = stop_decoder.finish().map_err(|e| {
+            error::internal_error(
+                "process_tokens_failed",
+                format!("Failed to finish token decoding: {e}"),
+            )
+        })?;
+        utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
@@ -980,13 +983,19 @@ impl ResponseProcessor {
                     }
                 }
 
+                let tail = stop_decoder.finish().map_err(|e| {
+                    error::internal_error(
+                        "process_tokens_failed",
+                        format!("Failed to finish token decoding: {e}"),
+                    )
+                })?;
+                utils::warn_detokenize_recoveries(
+                    &dispatch.request_id,
+                    index_offset + i as u32,
+                    stop_decoder,
+                );
                 if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
-                    stop_decoder.finish().map_err(|e| {
-                        error::internal_error(
-                            "process_tokens_failed",
-                            format!("Failed to finish token decoding: {e}"),
-                        )
-                    })?
+                    tail
                 {
                     decoded_text.push_str(&t);
                 }
@@ -1290,6 +1299,7 @@ mod responses_finish_reason_tests {
             );
             let (choice, _) = processor
                 .process_single_choice(
+                    "test-request",
                     &complete,
                     0,
                     &ChatResponseSpec::from(&request),
@@ -1349,6 +1359,7 @@ mod responses_finish_reason_tests {
             );
             let (choice, _) = processor
                 .process_single_choice(
+                    "test-request",
                     &complete,
                     0,
                     &spec,
@@ -1414,6 +1425,7 @@ plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
             );
             let (choice, _) = processor
                 .process_single_choice(
+                    "test-request",
                     &complete,
                     0,
                     &ChatResponseSpec::from(&request),
