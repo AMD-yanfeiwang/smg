@@ -1,9 +1,10 @@
 //! Keyed arguments written from the table's own tags, for the spellings the engines' `glm_xml`
 //! style does not write: Ling's, with the template's newline after the call's name, after each
 //! `</arg_key>` and before `</tool_call>`; GLM 4.5 and 4.6's, with it after the name, after each
-//! `</arg_key>` and after each `</arg_value>`; and Hy4's, every tag suffixed `:opensource` and the
-//! calls in a block. GLM 4.7's and IQuest's compact spelling keeps the `glm_xml` style, the shape
-//! the gateway writes for it today.
+//! `</arg_key>` and after each `</arg_value>`; K2-Horizon's, the same under `ifm|`-prefixed tags
+//! with the block's newline before each call and before its close; and Hy4's, every tag suffixed
+//! `:opensource` and the calls in a block. GLM 4.7's and IQuest's compact spelling keeps the
+//! `glm_xml` style, the shape the gateway writes for it today.
 //!
 //! A call is the call's opener and the tool's name, then one `<arg_key>` and `<arg_value>` pair per
 //! property of the tool's schema, in the schema's order, each optional unless the schema requires
@@ -58,12 +59,21 @@ pub(super) fn calls(
                     })
                     .collect(),
             );
-            block_of(
-                ways_in,
-                Grammar::Plus(Box::new(one_call)),
-                block.close,
-                at_least_one,
-            )
+            // The block's own newlines, where the template writes them: before each call and
+            // before the block's close (K2-Horizon); Hy4's block writes none.
+            let newlines = &tags.newlines;
+            let each = match newlines.block_before_call {
+                "" => one_call,
+                before => {
+                    Grammar::Sequence(vec![Grammar::ConstString(before.to_string()), one_call])
+                }
+            };
+            let all = Grammar::Plus(Box::new(each));
+            let inside = match newlines.block_before_close {
+                "" => all,
+                before => Grammar::Sequence(vec![all, Grammar::ConstString(before.to_string())]),
+            };
+            block_of(ways_in, inside, block.close, at_least_one)
         }
         None => Grammar::TriggeredTags {
             triggers: vec![markers.call_open.to_string()],
@@ -306,6 +316,71 @@ mod tests {
             tags[1]["end"].as_str().expect("end")
         );
         assert_eq!(written, "<tool_call>ping\n</tool_call>");
+    }
+
+    #[test]
+    fn k2_horizon_writes_its_block_with_a_newline_before_each_call_and_before_the_close() {
+        // K2-Horizon's template writes `<ifm|tool_calls>`, then each call after a newline, then a
+        // newline and `</ifm|tool_calls>`; every one of the recorded sets' 1,935 block openings,
+        // 1,250 call-to-call joins and 1,935 block closings reads so. The block holds one call or
+        // more, each GLM 4.6's pair spelling under the `ifm|` tags, and a zero-argument call is its
+        // name and a newline.
+        let payload = formats::k2_horizon()
+            .grammar(&weather_tools(), true, false)
+            .expect("a grammar")
+            .payload();
+        let block = &payload["format"]["tags"][0];
+        assert_eq!(block["begin"], "<ifm|tool_calls>");
+        assert_eq!(block["end"], "</ifm|tool_calls>");
+        let inside = block["content"]["elements"]
+            .as_array()
+            .expect("calls, then the newline");
+        assert_eq!(inside[1], value!({"type": "const_string", "value": "\n"}));
+        assert_eq!(inside[0]["type"], "plus");
+        let each = inside[0]["content"]["elements"]
+            .as_array()
+            .expect("the newline, then one of the calls");
+        assert_eq!(each[0], value!({"type": "const_string", "value": "\n"}));
+        let calls = each[1]["elements"].as_array().expect("two tools");
+        let weather = calls[0]["elements"].as_array().expect("a call's parts");
+        assert_eq!(weather[0]["value"], "<ifm|tool_call>get_weather\n");
+        assert_eq!(weather[2]["value"], "</ifm|tool_call>");
+        let city = weather[1]["elements"][0]["elements"]
+            .as_array()
+            .expect("the first pair's parts");
+        assert_eq!(city[2]["value"], "</ifm|arg_key>\n<ifm|arg_value>");
+        assert_eq!(city[4]["value"], "</ifm|arg_value>\n");
+        let ping = calls[1]["elements"]
+            .as_array()
+            .expect("the zero-argument call's parts");
+        assert_eq!(ping[0]["value"], "<ifm|tool_call>ping\n");
+        assert_eq!(ping[1]["type"], "star");
+        assert_eq!(ping[2]["value"], "</ifm|tool_call>");
+        // With the thought open, the same block follows a prefix that excludes the call tags.
+        let with_prefix = formats::k2_horizon()
+            .grammar(&weather_tools(), true, true)
+            .expect("a grammar")
+            .payload();
+        let parts = with_prefix["format"]["elements"]
+            .as_array()
+            .expect("prefix, then the block");
+        let excludes = parts[0]["excludes"].as_array().expect("the excluded tags");
+        for tag in [
+            "<ifm|tool_calls>",
+            "</ifm|tool_calls>",
+            "<ifm|tool_call>",
+            "</ifm|tool_call>",
+            "<ifm|arg_key>",
+            "</ifm|arg_key>",
+            "<ifm|arg_value>",
+            "</ifm|arg_value>",
+        ] {
+            assert!(
+                excludes.contains(&value!(tag)),
+                "{tag} is excluded from the prefix"
+            );
+        }
+        assert_eq!(parts[1]["tags"][0]["begin"], "<ifm|tool_calls>");
     }
 
     #[test]
