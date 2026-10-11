@@ -32,8 +32,21 @@ def _install(monkeypatch, name: str, **attrs) -> types.ModuleType:
     parent, _, child = name.rpartition(".")
     if parent:
         parent_module = sys.modules.get(parent) or _install(monkeypatch, parent)
-        setattr(parent_module, child, module)
+        # Undone with the test: the parent is the real package where an engine is installed.
+        monkeypatch.setattr(parent_module, child, module, raising=False)
     return module
+
+
+def _install_fake_servicer(monkeypatch, server, init_servicer_tracing=None):
+    """A fake ``smg.servicer`` binding under a fake ``smg`` package: the
+    installed package, where there is one, keeps its own ``servicer`` module."""
+    _install(monkeypatch, "smg")
+    return _install(
+        monkeypatch,
+        "smg.servicer",
+        TokenSpeedGrpcServer=server,
+        init_servicer_tracing=init_servicer_tracing or (lambda level=None: None),
+    )
 
 
 def _stub_servicer_module(monkeypatch, modalities=(1,)):
@@ -428,12 +441,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
             )
             self.address = bind_address
 
-    _install(
-        monkeypatch,
-        "smg.servicer",
-        TokenSpeedGrpcServer=FakeServer,
-        init_servicer_tracing=lambda level=None: None,
-    )
+    _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust, "model_facts", lambda args: {"model_path": args.model})
     monkeypatch.setattr(
         rust,
@@ -493,12 +501,7 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
             created.update(kwargs)
             self.address = kwargs["bind_address"]
 
-    _install(
-        monkeypatch,
-        "smg.servicer",
-        TokenSpeedGrpcServer=FakeServer,
-        init_servicer_tracing=lambda level=None: None,
-    )
+    _install_fake_servicer(monkeypatch, FakeServer)
     _stub_servicer_module(monkeypatch)
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(
@@ -546,3 +549,30 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     assert not unexpected, f"keywords the binding's constructor does not take: {unexpected}"
     # The required parameters are all given too; pyo3 refuses the call otherwise.
     signature.bind(**created)
+
+
+def test_serve_rust_fakes_leave_the_installed_package_untouched(tmp_path):
+    """The fakes `_run_serve_rust` installs go under a fake ``smg`` package, so
+    the installed one keeps its own ``servicer`` module once the test is over.
+    Skipped where the `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    package = sys.modules["smg"]
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _run_serve_rust(monkeypatch, tmp_path)
+    assert sys.modules["smg"] is package
+    assert package.servicer is servicer
+
+
+def test_install_undoes_a_fake_under_a_real_package():
+    """A fake installed under a real package is undone with the test, the
+    attribute on the package like the ``sys.modules`` entry, so a later
+    ``from smg_grpc_servicer.tokenspeed import servicer`` gets the real module.
+    ``_stub_servicer_module`` and the launcher test's fake ``server`` take this path."""
+    from smg_grpc_servicer import tokenspeed as package
+
+    name = "smg_grpc_servicer.tokenspeed.servicer"
+    before = (vars(package).get("servicer"), sys.modules.get(name))
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        fake = _install(monkeypatch, name)
+        assert package.servicer is fake and sys.modules[name] is fake
+    assert (vars(package).get("servicer"), sys.modules.get(name)) == before
