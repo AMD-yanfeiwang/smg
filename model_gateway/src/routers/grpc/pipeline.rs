@@ -639,14 +639,7 @@ impl RequestPipeline {
     ) -> Result<RunOutcome, Response> {
         let mut attempt_start = Instant::now();
         if let Some(endpoint) = metrics_endpoint {
-            Metrics::record_router_request(
-                metrics_labels::ROUTER_GRPC,
-                self.backend_type,
-                metrics_labels::CONNECTION_GRPC,
-                &ctx.input.model_id,
-                endpoint,
-                bool_to_static_str(ctx.is_streaming()),
-            );
+            self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
         }
 
         let build = match self.run_ingress(&mut ctx).await {
@@ -678,14 +671,7 @@ impl RequestPipeline {
             if attempt > 0 {
                 attempt_start = Instant::now();
                 if let Some(endpoint) = metrics_endpoint {
-                    Metrics::record_router_request(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &dctx.model_id,
-                        endpoint,
-                        bool_to_static_str(dctx.streaming),
-                    );
+                    self.record_request(endpoint, &dctx.model_id, dctx.streaming);
                 }
             }
 
@@ -805,7 +791,28 @@ impl RequestPipeline {
         response
     }
 
-    fn record_error(&self, endpoint: Option<&'static str>, model: &str, response: &Response) {
+    /// One router request under this pipeline's labels, the count the
+    /// dashboards read: recorded per attempt here, and by the router for an
+    /// answer it gives without the pipeline, so that traffic stays visible.
+    pub(crate) fn record_request(&self, endpoint: &'static str, model: &str, streaming: bool) {
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            model,
+            endpoint,
+            bool_to_static_str(streaming),
+        );
+    }
+
+    /// A refused request under this pipeline's labels, by the response's
+    /// status class.
+    pub(crate) fn record_error(
+        &self,
+        endpoint: Option<&'static str>,
+        model: &str,
+        response: &Response,
+    ) {
         if let Some(endpoint) = endpoint {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_GRPC,
