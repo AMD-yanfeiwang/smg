@@ -260,6 +260,17 @@ grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
 explicitly when that matters; the engine keeps the backend of its first
 structured request either way, as it does behind vLLM's own frontend.
 
+Both vLLM servicers also advertise the engine's reasoning parser
+(`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
+a router reads off a worker's labels) and where its grammar starts on a prompt
+that ends inside the model's thinking block (`structured_outputs_start`): `after_reasoning` when
+a reasoning parser is set and `enable_in_reasoning` is off, since vLLM then
+holds a request's grammar back until the parser has seen the thought's end,
+`first_token` otherwise. A router shapes a forced tool call's grammar by it as
+the engine's own server would: the bare calls behind the parser's gate, so the
+call is forced right there; the thought and then the calls from the first
+token.
+
 #### Multi-node engines: the worker pod's liveness
 
 An engine whose tensor-parallel ranks span pods runs its EngineCore and the
@@ -358,6 +369,17 @@ tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
 
+Both TokenSpeed servicers advertise, as `server_args` keys, the engine's
+reasoning parser (`engine_reasoning_parser`; `reasoning_parser` is the
+per-model parser override a router reads off a worker's labels) and where its
+grammar starts on a prompt that ends inside the model's thinking block
+(`structured_outputs_start`): always `first_token`, since this engine's grammar
+manager has no reasoning gate and starts every grammar at the first generated
+token (`--reasoning-parser` only has a JSON-schema constraint rewritten into a
+structural tag that lets the thought precede the JSON). A router shapes a
+forced tool call's grammar by it as the engine's own server would: the thought
+and then the calls, so the call is not forced into the thought.
+
 #### Multi-node engines: the worker pod's liveness
 
 An engine whose tensor-parallel ranks span pods is launched on every pod with
@@ -404,6 +426,18 @@ the flat `mm_item_limits` label (`image=1,video=1`) in `GetServerInfo`'s
 the engine's limits: the precomputed inputs it sends bypass the tokenizer
 manager's own check. Without the flag the engine has no such limit and the
 label is absent.
+
+They also advertise, as `server_args` keys, the engine's reasoning parser
+(`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
+a router reads off a worker's labels) and where its grammar starts on a prompt
+that ends inside the model's thinking block (`structured_outputs_start`):
+`after_reasoning` with `--reasoning-parser`, since the scheduler then wraps its
+grammar backend in a reasoner that holds a request's grammar back until the
+parser's thought-end sequence has been generated (for a request that asks for
+reasoning, which a router does on a thinking prompt), `first_token` without
+one. A router shapes a forced tool call's grammar by it as the engine's own
+server would: the bare calls behind the parser's gate, so the call is forced
+right there; the thought and then the calls from the first token.
 
 #### KV-event recovery
 
