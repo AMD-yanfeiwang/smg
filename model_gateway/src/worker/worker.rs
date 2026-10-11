@@ -641,6 +641,22 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn pushes_load_records(&self) -> bool {
         false
     }
+
+    /// Record whether the worker's latest load record reports its engine
+    /// silent on its in-flight requests for the wedge bound (see
+    /// [`super::liveness`]).
+    fn note_engine_stall(&self, _stalled: bool) {}
+
+    /// Whether the latest load record reported the engine stalled.
+    fn engine_stalled(&self) -> bool {
+        false
+    }
+
+    /// The prefill rate observed on this worker, tokens per second; zero
+    /// until a window of first tokens has been seen.
+    fn prefill_rate_tps(&self) -> u64 {
+        0
+    }
     /// Record the start of a request whose responses the gateway sees one by
     /// one (a streaming generation to this worker over gRPC): the pile the
     /// wedged rule counts, and the start of its clock when a run begins.
@@ -1439,6 +1455,9 @@ pub struct WorkerRuntime {
     /// The worker's KV-event stream has pushed a load record: silence is
     /// then judged by the stream's cadence (see [`super::liveness`]).
     pushed_loads: AtomicBool,
+    /// The latest pushed load record reports the engine silent on its
+    /// in-flight requests past the wedge bound (see [`super::liveness`]).
+    engine_stalled: AtomicBool,
     /// In-flight count at the previous liveness sweep.
     last_load_sample: AtomicUsize,
     /// Woken on every contact, so a loop backing off from this worker (the
@@ -1699,6 +1718,7 @@ impl WorkerRuntime {
             last_waiting_reqs: AtomicI64::new(0),
             transport_failed: AtomicBool::new(false),
             pushed_loads: AtomicBool::new(false),
+            engine_stalled: AtomicBool::new(false),
             last_load_sample: AtomicUsize::new(0),
             contact_wake: Arc::new(Notify::new()),
             admitted_at_ms: AtomicU64::new(super::liveness::now_ms()),
@@ -1804,6 +1824,14 @@ impl WorkerRuntime {
 
     pub fn pushes_load_records(&self) -> bool {
         self.pushed_loads.load(Ordering::Relaxed)
+    }
+
+    pub fn note_engine_stall(&self, stalled: bool) {
+        self.engine_stalled.store(stalled, Ordering::Relaxed);
+    }
+
+    pub fn engine_stalled(&self) -> bool {
+        self.engine_stalled.load(Ordering::Relaxed)
     }
 
     /// Time without a token or completion, counted from the later of the last
@@ -2618,6 +2646,18 @@ impl Worker for BasicWorker {
 
     fn pushes_load_records(&self) -> bool {
         self.runtime.load().pushes_load_records()
+    }
+
+    fn note_engine_stall(&self, stalled: bool) {
+        self.runtime.load().note_engine_stall(stalled);
+    }
+
+    fn engine_stalled(&self) -> bool {
+        self.runtime.load().engine_stalled()
+    }
+
+    fn prefill_rate_tps(&self) -> u64 {
+        self.runtime.load().prefill_rate_tps()
     }
 
     fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
