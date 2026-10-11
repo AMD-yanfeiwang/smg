@@ -47,7 +47,9 @@
 //! other state, its own row into the block. So the model closes whatever the prompt left open on
 //! its way to the calls, whichever that was.
 //!
-//! A table without calls gives `None`, and the gateway takes the JSON-schema path for it.
+//! A table without calls gives `None`, as does Inkling's named JSON until its tag is derived (a
+//! forced call's tag would start inside the first message, before any opener); the gateway takes
+//! the JSON-schema path for them.
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -318,6 +320,7 @@ impl Format {
             CallSyntax::Xml => {
                 return xml::calls(markers?, self.separator(), &named, at_least_one);
             }
+            CallSyntax::NamedJson(_) => return None,
         };
         if !reasoning_open {
             return Some(calls);
