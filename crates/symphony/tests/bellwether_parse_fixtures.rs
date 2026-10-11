@@ -627,8 +627,8 @@ impl Family {
             | Self::K2Horizon
             | Self::Plain => &[],
             // Ling and GLM read `<tool_call>` and `</think>`, so their two probes are the
-            // tagged ones' (no call comes of the fence); IQuest, DSML and LFM2.5 read `</think>`
-            // but not `<tool_call>`.
+            // tagged ones' (no call comes of the fence); IQuest, DSML, LFM2.5 and MiniMax M2 read
+            // `</think>` but not `<tool_call>`.
             Self::Ling | Self::Glm | Self::Glm4 => KNOWN_TAGGED_DIFFERENCES,
             Self::IQuest | Self::DeepSeekV4_1 | Self::Lfm2_5 | Self::MinimaxM2 => {
                 KNOWN_REASONING_PROBE
@@ -864,9 +864,9 @@ const FENCE_PROBE: KnownDifference = KnownDifference {
 /// Under the tagged syntax both probes differ.
 const KNOWN_TAGGED_DIFFERENCES: &[KnownDifference] = &[REASONING_PROBE, FENCE_PROBE];
 
-/// Under a table that reads `</think>` but not `<tool_call>` (DSML, IQuest), only the reasoning
-/// probe differs: the fence holds Qwen's syntax, which the table never reads as a call, so it is
-/// content, as the reference says.
+/// Under a table that reads `</think>` but not `<tool_call>`, only the reasoning probe differs:
+/// the fence holds Qwen's syntax, which the table never reads as a call, so it is content, as the
+/// reference says. The match on the family says which tables these are.
 const KNOWN_REASONING_PROBE: &[KnownDifference] = &[REASONING_PROBE];
 
 /// Under the MiniMax M3 table only the code-fence probe differs: the fence holds `<tool_call>`,
