@@ -5,6 +5,7 @@ mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;
 mod parsers;
+mod pd_bootstrap;
 pub(crate) mod stream_failure;
 pub(crate) mod tonic_ext;
 
@@ -31,6 +32,7 @@ pub(crate) use parsers::{
     reasoning_starts_in_prefill, rendered_prompt_reasoning_in_prefill,
     should_mark_reasoning_started, tool_constraints_for_worker, ParserResolver,
 };
+pub(crate) use pd_bootstrap::account_pd_leg_failure;
 pub(crate) use stream_failure::{send_stream_failure, StreamFailure, StreamSource};
 
 /// One WARN per choice whose stream recovered from a rewritten decode prefix
