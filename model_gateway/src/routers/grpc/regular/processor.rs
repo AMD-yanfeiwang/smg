@@ -86,6 +86,7 @@ impl ResponseProcessor {
         // ends to place the reasoning span in tokens.
         let mut final_text = String::new();
         let mut stopped = false;
+        let mut held = false;
         let mut token_ends = Vec::with_capacity(outputs.len());
         for output in outputs {
             match output {
@@ -95,7 +96,7 @@ impl ResponseProcessor {
                     stopped = true;
                 }
                 SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => {}
+                SequenceDecoderOutput::Held => held = true,
             }
             token_ends.push(final_text.len());
             if stopped {
@@ -103,16 +104,33 @@ impl ResponseProcessor {
             }
         }
 
-        // Flush remaining text. The decoder held it back for a partial stop
-        // match; the last token takes it, so the tokens' ends reach the end
-        // of the text, and the held tokens before it stay zero-width inside
-        // the span it closes.
-        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+        // Complete token decoding, including bytes and a partial stop match.
+        // The last token takes the tail so the token spans reach the text end.
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
+            stop_decoder
+                .finish()
+                .map_err(|e| format!("Failed to finish token decoding: {e}"))?
+        {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
             }
         }
+        if held
+            && tokenizer.uses_byte_fallback()
+            && original_request.separate_reasoning
+            && reasoning_parser_available
+        {
+            if let Some(ends) = eager_token_ends(
+                tokenizer,
+                &complete.output_ids()[..token_ends.len()],
+                stop_decoder.skip_special_tokens(),
+                &final_text,
+            ) {
+                token_ends = ends;
+            }
+        }
+        stopped |= stop_decoder.is_stopped();
 
         // Step 1: Handle reasoning content parsing
         let mut reasoning_text: Option<String> = None;
@@ -464,7 +482,18 @@ impl ResponseProcessor {
             }
 
             // Flush remaining text
-            if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+            let tail = stop_decoder.finish().map_err(|e| {
+                error::internal_error(
+                    "process_tokens_failed",
+                    format!("Failed to finish token decoding: {e}"),
+                )
+            })?;
+            let stopped_at_finish = matches!(
+                tail,
+                SequenceDecoderOutput::Stopped | SequenceDecoderOutput::StoppedWithText(_)
+            );
+            if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail
+            {
                 decoded_text.push_str(&t);
             }
 
@@ -472,10 +501,22 @@ impl ResponseProcessor {
             let finish_reason_str = complete.finish_reason();
 
             // Parse finish_reason from string to proper type
-            let finish_reason =
-                utils::parse_finish_reason(finish_reason_str, complete.completion_tokens());
+            let finish_reason = utils::parse_finish_reason(
+                if stopped_at_finish {
+                    "stop"
+                } else {
+                    finish_reason_str
+                },
+                complete.completion_tokens(),
+            );
 
-            let matched_stop = complete.matched_stop_json();
+            let matched_stop = if stopped_at_finish {
+                stop_decoder
+                    .matched_stop()
+                    .map(|stop| serde_json::Value::String(stop.to_string()))
+            } else {
+                complete.matched_stop_json()
+            };
 
             // Extract logprobs if requested (convert proto types to Generate format)
             let input_token_logprobs = if request_logprobs {
@@ -632,6 +673,7 @@ impl ResponseProcessor {
         // ends to place the thinking span in tokens (as the chat path does).
         let mut final_text = String::new();
         let mut stopped = false;
+        let mut held = false;
         let mut token_ends = Vec::with_capacity(outputs.len());
         for output in outputs {
             match output {
@@ -641,19 +683,37 @@ impl ResponseProcessor {
                     stopped = true;
                 }
                 SequenceDecoderOutput::Stopped => stopped = true,
-                SequenceDecoderOutput::Held => {}
+                SequenceDecoderOutput::Held => held = true,
             }
             token_ends.push(final_text.len());
             if stopped {
                 break;
             }
         }
-        if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+        if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
+            stop_decoder.finish().map_err(|e| {
+                error::internal_error(
+                    "process_tokens_failed",
+                    format!("Failed to finish token decoding: {e}"),
+                )
+            })?
+        {
             final_text.push_str(&t);
             if let Some(last) = token_ends.last_mut() {
                 *last = final_text.len();
             }
         }
+        if held && tokenizer.uses_byte_fallback() && reasoning_parser_available {
+            if let Some(ends) = eager_token_ends(
+                &tokenizer,
+                &complete.output_ids()[..token_ends.len()],
+                stop_decoder.skip_special_tokens(),
+                &final_text,
+            ) {
+                token_ends = ends;
+            }
+        }
+        stopped |= stop_decoder.is_stopped();
 
         // Step 1: Parse reasoning content
         let mut reasoning_text: Option<String> = None;
@@ -931,9 +991,17 @@ impl ResponseProcessor {
                     }
                 }
 
-                if let SequenceDecoderOutput::Text(t) = stop_decoder.flush() {
+                if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) =
+                    stop_decoder.finish().map_err(|e| {
+                        error::internal_error(
+                            "process_tokens_failed",
+                            format!("Failed to finish token decoding: {e}"),
+                        )
+                    })?
+                {
                     decoded_text.push_str(&t);
                 }
+                stopped |= stop_decoder.is_stopped();
 
                 prompt_tokens = prompt_tokens.max(complete.prompt_tokens());
                 total_completion += complete.completion_tokens();
@@ -1010,6 +1078,38 @@ impl ResponseProcessor {
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }
+}
+
+// Byte buffering can release several tokens at once. Observe their original
+// eager boundaries only for accounting; canonical text and stops stay with the
+// stable decoder. A mismatched observation keeps the existing span estimate.
+fn eager_token_ends(
+    tokenizer: &Arc<dyn Tokenizer>,
+    token_ids: &[u32],
+    skip_special_tokens: bool,
+    text: &str,
+) -> Option<Vec<usize>> {
+    let mut ids = Vec::new();
+    let mut prefix = String::new();
+    let mut prefix_index = 0;
+    let mut observed = String::new();
+    let mut ends = Vec::with_capacity(token_ids.len());
+    for &token_id in token_ids {
+        if let Some(delta) = tokenizer
+            .decode_step_eager(
+                token_id,
+                &mut ids,
+                &mut prefix,
+                &mut prefix_index,
+                skip_special_tokens,
+            )
+            .ok()?
+        {
+            observed.push_str(&delta);
+        }
+        ends.push(observed.len().min(text.len()));
+    }
+    observed.starts_with(text).then_some(ends)
 }
 
 /// Tokens of the output whose text overlaps the reasoning span, given the

@@ -522,7 +522,7 @@ impl StreamingProcessor {
         }
 
         // Phase 2: Main streaming loop
-        let mut final_indices: Option<Vec<u32>> = None;
+        let mut final_indices: Option<Vec<(u32, bool)>> = None;
         loop {
             let response = if final_indices.is_none() {
                 // The chunks written so far leave as a frame before the
@@ -545,7 +545,7 @@ impl StreamingProcessor {
             } else {
                 None
             };
-            let final_chunk = response.is_none();
+            let mut final_chunk = response.is_none();
 
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
@@ -661,16 +661,31 @@ impl StreamingProcessor {
                 Some(ProtoResponseVariant::Complete(complete)) => {
                     let index = complete.index();
 
-                    // Release whatever the stop decoder still holds. It only ever
-                    // retains a partial stop-sequence match, and it is routed through
-                    // the same parsers as every other chunk rather than straight out.
-                    let flushed =
-                        stop_decoders
-                            .get_mut(&index)
-                            .and_then(|decoder| match decoder.flush() {
-                                SequenceDecoderOutput::Text(text) if !text.is_empty() => Some(text),
+                    // Complete byte decoding before routing held text through the
+                    // same reasoning/tool parsers as ordinary chunks.
+                    let flushed = match stop_decoders.get_mut(&index) {
+                        Some(decoder) => {
+                            let tail = decoder.finish().map_err(|e| e.to_string())?;
+                            if decoder.is_stopped() {
+                                stopped_indices.insert(index);
+                                finish_reasons.insert(index, "stop".to_string());
+                                matched_stops.insert(
+                                    index,
+                                    decoder.matched_stop().map(|s| Value::String(s.to_string())),
+                                );
+                            }
+                            match tail {
+                                SequenceDecoderOutput::Text(text)
+                                | SequenceDecoderOutput::StoppedWithText(text)
+                                    if !text.is_empty() =>
+                                {
+                                    Some(text)
+                                }
                                 _ => None,
-                            });
+                            }
+                        }
+                        None => None,
+                    };
 
                     // Store metadata
                     prompt_tokens.insert(index, complete.prompt_tokens());
@@ -699,11 +714,54 @@ impl StreamingProcessor {
                 }
                 Some(ProtoResponseVariant::None) => continue,
                 None => {
-                    // Route each parser's EOF text through the same tool and content path.
-                    let indices = final_indices
-                        .get_or_insert_with(|| reasoning_parsers.keys().copied().collect());
-                    let Some(index) = indices.pop() else { break };
-                    Some((index, String::new(), None, 0))
+                    // Finish decoder text before sending EOF to the parsers. A
+                    // clean transport EOF does not supply Complete metadata.
+                    let indices = final_indices.get_or_insert_with(|| {
+                        let mut indices: Vec<_> = stop_decoders
+                            .keys()
+                            .chain(reasoning_parsers.keys())
+                            .copied()
+                            .collect();
+                        indices.sort_unstable();
+                        indices.dedup();
+                        indices
+                            .into_iter()
+                            .flat_map(|index| [(index, true), (index, false)])
+                            .collect()
+                    });
+                    let Some((index, parser_eof)) = indices.pop() else {
+                        break;
+                    };
+                    final_chunk = parser_eof;
+                    let text = if parser_eof {
+                        String::new()
+                    } else {
+                        match stop_decoders.get_mut(&index) {
+                            Some(decoder) => {
+                                let tail = decoder.finish().map_err(|e| e.to_string())?;
+                                if decoder.is_stopped() {
+                                    stopped_indices.insert(index);
+                                    finish_reasons.insert(index, "stop".to_string());
+                                    matched_stops.insert(
+                                        index,
+                                        decoder
+                                            .matched_stop()
+                                            .map(|s| Value::String(s.to_string())),
+                                    );
+                                }
+                                match tail {
+                                    SequenceDecoderOutput::Text(text)
+                                    | SequenceDecoderOutput::StoppedWithText(text) => text,
+                                    _ => String::new(),
+                                }
+                            }
+                            None => String::new(),
+                        }
+                    };
+                    if !parser_eof && text.is_empty() {
+                        continue;
+                    }
+                    Some((index, text, None, held_tokens.remove(&index).unwrap_or(0)))
                 }
             };
 
@@ -2405,6 +2463,7 @@ impl StreamingProcessor {
         let mut parsed_thinking_tokens: u32 = 0;
         let mut engine_thinking_tokens: u32 = 0;
         let mut was_in_reasoning = false;
+        let mut held_tokens: u32 = 0;
         Self::send_messages_event(
             tx,
             &mut sse_buffer,
@@ -2416,12 +2475,17 @@ impl StreamingProcessor {
 
         // Phase 2: Main streaming loop
         let mut final_chunk = false;
+        let mut decoder_finished_at_eof = false;
         while !final_chunk {
             let response =
-                grpc_stream.next().await.transpose().map_err(|e| {
-                    utils::StreamFailure::upstream(e, completion_tokens.delivered())
-                })?;
-            final_chunk = response.is_none();
+                if decoder_finished_at_eof {
+                    None
+                } else {
+                    grpc_stream.next().await.transpose().map_err(|e| {
+                        utils::StreamFailure::upstream(e, completion_tokens.delivered())
+                    })?
+                };
+            final_chunk = response.is_none() && decoder_finished_at_eof;
 
             // Text the stop decoder produced for this response, if any. Per-chunk
             // text and the end-of-stream flush both funnel into the shared emission
@@ -2458,17 +2522,29 @@ impl StreamingProcessor {
                     }
 
                     if chunk_text.is_empty() {
+                        held_tokens += chunk_tokens;
                         continue;
                     }
 
+                    chunk_tokens += std::mem::take(&mut held_tokens);
                     Some(chunk_text)
                 }
                 Some(ProtoResponseVariant::Complete(complete)) => {
-                    // Release whatever the stop decoder still holds. It only ever
-                    // retains a partial stop-sequence match, and it is routed through
-                    // the same parsers as every other chunk rather than straight out.
-                    let flushed = match stop_decoder.flush() {
-                        SequenceDecoderOutput::Text(text) if !text.is_empty() => Some(text),
+                    let tail = stop_decoder.finish().map_err(|e| e.to_string())?;
+                    if stop_decoder.is_stopped() {
+                        stopped = true;
+                        finish_reason_str = "stop".to_string();
+                        matched_stop = stop_decoder
+                            .matched_stop()
+                            .map(|s| Value::String(s.to_string()));
+                    }
+                    let flushed = match tail {
+                        SequenceDecoderOutput::Text(text)
+                        | SequenceDecoderOutput::StoppedWithText(text)
+                            if !text.is_empty() =>
+                        {
+                            Some(text)
+                        }
                         _ => None,
                     };
 
@@ -2482,9 +2558,35 @@ impl StreamingProcessor {
                         finish_reason_str = complete.finish_reason().to_string();
                         matched_stop = complete.matched_stop_json();
                     }
+                    if flushed.is_some() {
+                        chunk_tokens = std::mem::take(&mut held_tokens);
+                    }
                     flushed
                 }
                 Some(ProtoResponseVariant::None) => continue,
+                None if !decoder_finished_at_eof => {
+                    // Emit pending byte text, then flush the parser on the next
+                    // iteration without pretending the engine sent Complete.
+                    decoder_finished_at_eof = true;
+                    let tail = stop_decoder.finish().map_err(|e| e.to_string())?;
+                    if stop_decoder.is_stopped() {
+                        stopped = true;
+                        finish_reason_str = "stop".to_string();
+                        matched_stop = stop_decoder
+                            .matched_stop()
+                            .map(|s| Value::String(s.to_string()));
+                    }
+                    match tail {
+                        SequenceDecoderOutput::Text(text)
+                        | SequenceDecoderOutput::StoppedWithText(text)
+                            if !text.is_empty() =>
+                        {
+                            chunk_tokens = std::mem::take(&mut held_tokens);
+                            Some(text)
+                        }
+                        _ => continue,
+                    }
+                }
                 None if reasoning_parser.is_some() => Some(String::new()),
                 None => break,
             };
@@ -3506,7 +3608,13 @@ impl StreamingProcessor {
                     }
 
                     if let Some(decoder) = stop_decoders.get_mut(&index) {
-                        if let SequenceDecoderOutput::Text(text) = decoder.flush() {
+                        let tail = decoder.finish().map_err(|e| e.to_string())?;
+                        if decoder.is_stopped() {
+                            stopped_indices.insert(index);
+                        }
+                        if let SequenceDecoderOutput::Text(text)
+                        | SequenceDecoderOutput::StoppedWithText(text) = tail
+                        {
                             if !text.is_empty() {
                                 let stream_resp = CompletionStreamResponse {
                                     id: request_id.clone(),
@@ -3551,7 +3659,9 @@ impl StreamingProcessor {
                             .map_err(|_| "Channel closed".to_string())?;
                     }
 
-                    let finish_reason = {
+                    let finish_reason = if stopped_indices.contains(&index) {
+                        Some("stop".to_string())
+                    } else {
                         let reason = complete.finish_reason();
                         if reason.is_empty() || reason == "stop" {
                             Some("stop".to_string())
@@ -3598,6 +3708,47 @@ impl StreamingProcessor {
                 }
                 ProtoResponseVariant::None => continue,
             }
+        }
+
+        // Preserve pending text and locally matched stops on clean EOF without
+        // inventing engine usage. A local stop still honors the requested suffix.
+        for (index, decoder) in &mut stop_decoders {
+            if completed_indices.contains(index) || stopped_indices.contains(index) {
+                continue;
+            }
+            let tail = decoder.finish().map_err(|e| e.to_string())?;
+            let stopped = decoder.is_stopped();
+            let mut text = match tail {
+                SequenceDecoderOutput::Text(text)
+                | SequenceDecoderOutput::StoppedWithText(text) => text,
+                _ => String::new(),
+            };
+            if stopped {
+                if let Some(sfx) = suffix {
+                    text.push_str(sfx);
+                }
+            }
+            if text.is_empty() && !stopped {
+                continue;
+            }
+            let stream_resp = CompletionStreamResponse {
+                id: request_id.clone(),
+                object: "text_completion".to_string(),
+                created,
+                choices: vec![CompletionStreamChoice {
+                    text,
+                    index: *index,
+                    logprobs: None,
+                    finish_reason: stopped.then(|| "stop".to_string()),
+                }],
+                model: model.clone(),
+                system_fingerprint: system_fingerprint.map(String::from),
+                usage: None,
+            };
+            Self::format_completion_sse_into(&mut sse_buffer, &stream_resp);
+            tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                .await
+                .map_err(|_| "Channel closed".to_string())?;
         }
 
         grpc_stream.mark_completed();
@@ -4105,6 +4256,16 @@ mod tests {
         fn decode(&self, _token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
             Err(anyhow::anyhow!("tokenizer decode failed"))
         }
+
+        fn finish_decode(
+            &self,
+            _ids: &mut Vec<u32>,
+            _prefix: &mut String,
+            _prefix_index: &mut usize,
+            _skip_special_tokens: bool,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::anyhow!("pending token decode failed"))
+        }
     }
 
     impl Tokenizer for FailingTokenizer {
@@ -4143,6 +4304,22 @@ mod tests {
 
         let err = result.expect_err("decode failure must propagate");
         assert!(err.contains("Stop decoder failed to process token"));
+    }
+
+    #[test]
+    fn finish_preserves_pending_decode_errors() {
+        let tokenizer = Arc::new(FailingTokenizer {
+            special_tokens: llm_tokenizer::SpecialTokens::default(),
+        });
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer,
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let error = decoder
+            .finish()
+            .expect_err("EOF decode error must propagate");
+        assert!(error.to_string().contains("pending token decode failed"));
     }
 
     #[test]

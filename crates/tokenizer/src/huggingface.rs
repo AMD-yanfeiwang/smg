@@ -3,6 +3,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use anyhow::{Error, Result};
 use serde::Deserialize;
 use tokenizers::{
+    decoders::DecoderWrapper,
     models::{bpe::BPE, ModelWrapper},
     normalizers::unicode::NFC,
     pre_tokenizers::{
@@ -55,6 +56,15 @@ pub struct HuggingFaceTokenizer {
     /// The direct encode path for byte-level BPE tokenizers of the common
     /// shape (see `native`); `None` keeps every encode in `tokenizers`.
     native: Option<NativeEncoder>,
+    has_byte_fallback: bool,
+}
+
+fn has_byte_fallback(decoder: &DecoderWrapper) -> bool {
+    match decoder {
+        DecoderWrapper::ByteFallback(_) => true,
+        DecoderWrapper::Sequence(sequence) => sequence.get_decoders().iter().any(has_byte_fallback),
+        _ => false,
+    }
 }
 
 pub(crate) const QWEN2_PRETOKENIZE_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
@@ -293,6 +303,7 @@ impl HuggingFaceTokenizer {
 
         let native = NativeEncoder::from_tokenizer(&tokenizer);
         Self::bound_bpe_cache(&mut tokenizer, Self::bpe_words_cached(native.as_ref()));
+        let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             native,
@@ -303,6 +314,22 @@ impl HuggingFaceTokenizer {
             chat_template: ChatTemplateState::new(chat_template_str)?,
             eos_token_ids,
             renderer,
+            has_byte_fallback,
+        })
+    }
+
+    fn byte_fallback_piece(&self, token_id: TokenIdType, skip_special_tokens: bool) -> bool {
+        self.reverse_vocab.get(&token_id).is_some_and(|token| {
+            let byte_token = token.len() == 6
+                && token.starts_with("<0x")
+                && token.ends_with('>')
+                && token.as_bytes()[3..5].iter().all(u8::is_ascii_hexdigit);
+            byte_token
+                || (skip_special_tokens
+                    && self
+                        .tokenizer
+                        .get_added_vocabulary()
+                        .is_special_token(token))
         })
     }
 
@@ -411,6 +438,7 @@ impl HuggingFaceTokenizer {
             .map(|(token, &id)| (id, token.clone()))
             .collect();
 
+        let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             native,
@@ -421,6 +449,7 @@ impl HuggingFaceTokenizer {
             chat_template: ChatTemplateState::empty(),
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
+            has_byte_fallback,
         }
     }
 
@@ -577,6 +606,10 @@ impl Encoder for HuggingFaceTokenizer {
 }
 
 impl Decoder for HuggingFaceTokenizer {
+    fn uses_byte_fallback(&self) -> bool {
+        self.has_byte_fallback
+    }
+
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         self.tokenizer
             .decode(token_ids, skip_special_tokens)
@@ -589,6 +622,64 @@ impl Decoder for HuggingFaceTokenizer {
     /// the two internal `decode()` calls go directly through the concrete
     /// `TokenizerImpl` rather than through `dyn Decoder` vtable dispatch.
     fn decode_step(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        // ByteFallback replaces every byte of an invalid run, including ASCII
+        // bytes already decoded. Do not emit a run until a real token closes it.
+        if self.has_byte_fallback {
+            if prefix.is_empty() && *prefix_index > 0 {
+                let prefill = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+                let stable_seed_end = ids[..*prefix_index]
+                    .iter()
+                    .rposition(|&id| !self.byte_fallback_piece(id, skip_special_tokens))
+                    .map_or(0, |index| index + 1);
+                if prefill.ends_with('�') {
+                    // Keep an unfinished seed byte run as decode context, but
+                    // suppress the stable prompt text before it.
+                    *prefix_index = stable_seed_end;
+                    *prefix = self.decode(&ids[..*prefix_index], skip_special_tokens)?;
+                } else if stable_seed_end < *prefix_index {
+                    // A completed seed run is prompt text. Start new bytes at
+                    // its boundary so later invalid bytes cannot rewrite it.
+                    ids.truncate(stable_seed_end);
+                    *prefix_index = stable_seed_end;
+                    *prefix = self.decode(ids, skip_special_tokens)?;
+                } else {
+                    *prefix = prefill;
+                }
+            }
+            if self.byte_fallback_piece(token_id, skip_special_tokens) {
+                ids.push(token_id);
+                return Ok(None);
+            }
+        }
+        let tokens = if self.has_byte_fallback && prefix.is_empty() {
+            // These IDs have not been emitted, so they are input, not a prefill
+            // prefix for the native streaming decoder.
+            let mut pending = std::mem::take(ids);
+            pending.push(token_id);
+            *prefix_index = 0;
+            pending
+        } else {
+            vec![token_id]
+        };
+        step_decode_stream(
+            &self.tokenizer,
+            tokens,
+            skip_special_tokens,
+            ids,
+            prefix,
+            prefix_index,
+        )
+        .map_err(|e| Error::msg(format!("Decode stream error: {e}")))
+    }
+
+    fn decode_step_eager(
         &self,
         token_id: TokenIdType,
         ids: &mut Vec<TokenIdType>,
@@ -619,6 +710,32 @@ impl Decoder for HuggingFaceTokenizer {
             skip_special_tokens,
             UnknownId::Drop,
         )))
+    }
+
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<String> {
+        if !self.has_byte_fallback {
+            return Ok(String::new());
+        }
+        if prefix.is_empty() && ids.len() == *prefix_index {
+            ids.clear();
+            *prefix_index = 0;
+            return Ok(String::new());
+        }
+        let decoded = self.decode(ids, skip_special_tokens)?;
+        let pending = decoded
+            .strip_prefix(prefix.as_str())
+            .ok_or_else(|| Error::msg("Decode stream prefix changed at end of input"))?
+            .to_string();
+        ids.clear();
+        prefix.clear();
+        *prefix_index = 0;
+        Ok(pending)
     }
 }
 

@@ -100,6 +100,22 @@ pub trait IncrementalDecoder: Send + Sync {
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
 
+    /// Whether the configured decoder contains ByteFallback byte-run buffering.
+    fn uses_byte_fallback(&self) -> bool {
+        false
+    }
+
+    /// Release text buffered by incremental decoding at end of input.
+    fn finish_decode(
+        &self,
+        _ids: &mut Vec<TokenIdType>,
+        _prefix: &mut String,
+        _prefix_index: &mut usize,
+        _skip_special_tokens: bool,
+    ) -> Result<String> {
+        Ok(String::new())
+    }
+
     /// Incremental decode step — called once per generated token.
     ///
     /// Maintains mutable state (`ids`, `prefix`, `prefix_index`) across calls to
@@ -148,6 +164,19 @@ pub trait Decoder: Send + Sync {
         } else {
             Ok(None)
         }
+    }
+
+    /// Eager text observation for engine-side stop matching. Unlike client
+    /// output, this must observe a stop at its original generated-token count.
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
     }
 
     /// A dedicated per-stream decoder, when the backend has a cheaper

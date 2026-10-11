@@ -285,6 +285,10 @@ impl Encoder for CachedTokenizer {
 }
 
 impl Decoder for CachedTokenizer {
+    fn uses_byte_fallback(&self) -> bool {
+        self.inner.uses_byte_fallback()
+    }
+
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         // Decoding is not cached (it's fast enough and rarely repeated)
         self.inner.decode(token_ids, skip_special_tokens)
@@ -302,6 +306,29 @@ impl Decoder for CachedTokenizer {
     ) -> Result<Option<String>> {
         self.inner
             .decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.inner
+            .decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<String> {
+        self.inner
+            .finish_decode(ids, prefix, prefix_index, skip_special_tokens)
     }
 
     fn incremental_decoder(
