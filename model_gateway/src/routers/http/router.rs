@@ -2461,7 +2461,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_recovers_on_second_connection() {
         let (addr, accepted) = flaky_upstream(1).await;
-        let client = reqwest::Client::new();
+        let client = crate::http_client::client();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let res = send_with_stale_conn_retry(builder).await.unwrap();
@@ -2472,7 +2472,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_is_bounded_to_one() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = reqwest::Client::new();
+        let client = crate::http_client::client();
         let builder = client.post(format!("http://{addr}/generate")).body("{}");
 
         let err = send_with_stale_conn_retry(builder).await.unwrap_err();
@@ -2483,7 +2483,7 @@ mod tests {
     #[tokio::test]
     async fn stale_conn_retry_skips_unclonable_bodies() {
         let (addr, accepted) = flaky_upstream(usize::MAX).await;
-        let client = reqwest::Client::new();
+        let client = crate::http_client::client();
         let stream_body = reqwest::Body::wrap_stream(stream::once(async {
             Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
         }));
@@ -4010,7 +4010,7 @@ mod tests {
         // timeout fires.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let client = reqwest::Client::builder()
+        let client = crate::http_client::client_builder()
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
@@ -4037,7 +4037,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
-        let err = reqwest::Client::new()
+        let err = crate::http_client::client()
             .get(format!("http://{addr}/generate"))
             .send()
             .await
@@ -4117,7 +4117,7 @@ mod upstream_span_tests {
             }
             socket.write_all(b"0\r\n\r\n").await.expect("last chunk");
         });
-        let client = reqwest::Client::new();
+        let client = crate::http_client::client();
         let response =
             send_with_stale_conn_retry(client.get(format!("http://{addr}/v1/chat/completions")))
                 .instrument(tracing::info_span!("http_request"))
