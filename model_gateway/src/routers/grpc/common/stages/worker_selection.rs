@@ -1,6 +1,7 @@
 //! Worker selection stage: Select appropriate worker(s) based on routing mode
 
 use std::{
+    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -12,10 +13,13 @@ use axum::{
 };
 use tracing::{debug, error, warn};
 
-use super::PipelineStage;
+use super::{helpers, PipelineStage};
 use crate::{
-    middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
-    observability::metrics::{metrics_labels, Metrics},
+    middleware::{tenant_resolution::AcceptedAt, ReportedRefusal, SHED_RETRY_AFTER_SECS},
+    observability::{
+        log_throttle::KeyedLogThrottle,
+        metrics::{metrics_labels, Metrics},
+    },
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
         common::{
@@ -74,6 +78,26 @@ type EncodePrefillDecodeWorkerSelection = (
 /// selection because it had already waited longer than the queue timeout
 /// inside the gateway.
 pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_timeout";
+
+/// Lines per second and per model the stage writes for refusals of a model
+/// whose workers are all unavailable (`no_available_workers`). One line per
+/// refusal, with the request id, the model and the pool's state, shows the
+/// condition and whom it hits; past this rate the lines are counted and the
+/// next one carries the count, while `smg_router_request_errors_total`
+/// keeps the volume. A client retrying at once against a drained pool drew
+/// about two thousand refusals a second, three ERROR lines each, before.
+const NO_AVAILABLE_WORKERS_LINES_PER_SECOND: u32 = 10;
+
+/// Models the refusal throttle tracks at once; past this the model seen
+/// least recently is forgotten (a model that is down keeps refusing, so it
+/// stays). One storming model never silences another's first line.
+const NO_AVAILABLE_WORKERS_LOG_MODELS: usize = 64;
+
+static NO_AVAILABLE_WORKERS_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    NO_AVAILABLE_WORKERS_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    NO_AVAILABLE_WORKERS_LOG_MODELS,
+);
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub(crate) struct WorkerSelectionStage {
@@ -230,6 +254,26 @@ fn disaggregated((prefill, decode, runtime_type): PdWorkerPair) -> WorkerSelecti
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+        self.select(ctx).await.map_err(|refusal| {
+            let request_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref());
+            self.report_refusal(
+                "WorkerSelectionStage::execute",
+                request_id,
+                &ctx.input.model_id,
+                refusal,
+            )
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "WorkerSelection"
+    }
+}
+
+impl WorkerSelectionStage {
+    /// The selection behind [`PipelineStage::execute`]; a refusal it returns
+    /// is reported there by [`Self::report_refusal`].
+    async fn select(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let accepted = self.acceptance_for_selection(ctx);
         if let Some(refused) = accepted.and_then(|accepted| self.refuse_if_expired(ctx, accepted)) {
             return Err(refused);
@@ -438,10 +482,6 @@ impl PipelineStage for WorkerSelectionStage {
         ctx.state.workers = Some(workers);
         Ok(())
     }
-
-    fn name(&self) -> &'static str {
-        "WorkerSelection"
-    }
 }
 
 impl WorkerSelectionStage {
@@ -458,6 +498,18 @@ impl WorkerSelectionStage {
     /// bootstrap rooms. A disaggregated retry takes a fresh Prefill
     /// admission slot for its new prefill worker.
     pub(crate) async fn reselect(&self, ctx: &mut DispatchContext) -> Result<(), Response> {
+        self.reselect_workers(ctx).await.map_err(|refusal| {
+            self.report_refusal(
+                "WorkerSelectionStage::reselect",
+                ctx.request_id.as_deref(),
+                &ctx.model_id,
+                refusal,
+            )
+        })
+    }
+
+    /// The re-selection behind [`Self::reselect`].
+    async fn reselect_workers(&self, ctx: &mut DispatchContext) -> Result<(), Response> {
         let text = ctx.routing.routing_text.as_deref();
         let tokens = if ctx.routing.token_ids.is_empty() {
             None
@@ -569,7 +621,7 @@ impl WorkerSelectionStage {
         )
         .await
         .map_err(|error| {
-            self.acquire_failure(model_id, error, |failure| {
+            Self::acquire_failure(model_id, error, |failure| {
                 self.pd_pair_failure(model_id, *failure, media_refs)
             })
         })
@@ -598,7 +650,7 @@ impl WorkerSelectionStage {
         )
         .await
         .map_err(|error| {
-            self.acquire_failure(model_id, error, |_| {
+            Self::acquire_failure(model_id, error, |_| {
                 // Encode is a demanded leg only when the request carries
                 // encode items; an idle-but-vetoed encode pool must not shed
                 // a text-only request.
@@ -615,7 +667,6 @@ impl WorkerSelectionStage {
     /// The response for a failed admission: the selection's own verdict when
     /// selection ran, a 429 when the queue refused the request.
     fn acquire_failure<E>(
-        &self,
         model_id: &str,
         error: PrefillAcquireError<E>,
         candidate: impl FnOnce(E) -> Response,
@@ -629,9 +680,49 @@ impl WorkerSelectionStage {
                 prefill_queue_timeout()
             }
             PrefillAcquireError::Rejected(PrefillAdmissionRejection::Unavailable) => {
-                self.workers_unavailable(model_id)
+                Self::workers_unavailable(model_id)
             }
         }
+    }
+}
+
+/// What a refusal line says about the pools it drew from: per leg, the
+/// workers registered for the model, those healthy, and those routable
+/// (healthy, circuit closed, not vetoed by load or liveness).
+struct PoolState {
+    legs: Vec<LegState>,
+}
+
+struct LegState {
+    leg: &'static str,
+    workers: usize,
+    healthy: usize,
+    available: usize,
+}
+
+impl PoolState {
+    fn workers(&self) -> usize {
+        self.legs.iter().map(|leg| leg.workers).sum()
+    }
+
+    fn available(&self) -> usize {
+        self.legs.iter().map(|leg| leg.available).sum()
+    }
+}
+
+impl fmt::Display for PoolState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, leg) in self.legs.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(
+                f,
+                "{} {}/{} available ({} healthy)",
+                leg.leg, leg.available, leg.workers, leg.healthy
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -757,7 +848,7 @@ impl WorkerSelectionStage {
             }
         }
         if unavailable {
-            return self.workers_unavailable(model_id);
+            return Self::workers_unavailable(model_id);
         }
         error!(
             function = "WorkerSelectionStage::execute",
@@ -813,7 +904,7 @@ impl WorkerSelectionStage {
             }
         }
         if unavailable {
-            return self.workers_unavailable(model_id);
+            return Self::workers_unavailable(model_id);
         }
         error!(
             function = "WorkerSelectionStage::execute",
@@ -850,16 +941,105 @@ impl WorkerSelectionStage {
     /// retry, and nothing about its request is wrong. Answering 404 here told
     /// clients the model was gone while its workers restarted. Terminal for
     /// the pipeline's own retry loop (see `placement::no_available_workers`).
-    fn workers_unavailable(&self, model_id: &str) -> Response {
-        error!(
-            function = "WorkerSelectionStage::execute",
-            mode = ?self.mode,
-            model_id = %model_id,
-            "No available workers for model"
-        );
+    /// Logged by [`Self::report_refusal`] at the stage's entry points, once
+    /// per refusal and rate-limited, not here.
+    fn workers_unavailable(model_id: &str) -> Response {
         placement::no_available_workers(format!(
             "All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"
         ))
+    }
+
+    /// The log line of a `no_available_workers` refusal, and its marker.
+    ///
+    /// One WARN per refusal with the refusing function, the request id, the
+    /// model and the state of the pools the stage draws from, capped per
+    /// model at [`NO_AVAILABLE_WORKERS_LINES_PER_SECOND`]; a line past the
+    /// cap is counted and the next admitted line for that model carries the
+    /// count as `suppressed`. The response is marked [`ReportedRefusal`], so
+    /// the pipeline's lines and the access log's response line drop to DEBUG
+    /// for it: a refusal is the gateway's normal answer to "no worker right
+    /// now", not a fault of its own, and three ERROR lines per refusal made
+    /// a client's retry loop against a drained pool a log storm. The error
+    /// counter (`smg_router_request_errors_total`, recorded by the pipeline)
+    /// keeps the volume. Every other refusal passes through unchanged.
+    fn report_refusal(
+        &self,
+        function: &'static str,
+        request_id: Option<&str>,
+        model_id: &str,
+        refusal: Response,
+    ) -> Response {
+        self.report_refusal_with(
+            &NO_AVAILABLE_WORKERS_LOG,
+            function,
+            request_id,
+            model_id,
+            refusal,
+        )
+    }
+
+    /// [`Self::report_refusal`] under an explicit throttle. The id is a
+    /// field only when the caller has one: the request's span carries it
+    /// too, and an empty field would read as an id.
+    fn report_refusal_with(
+        &self,
+        throttle: &KeyedLogThrottle,
+        function: &'static str,
+        request_id: Option<&str>,
+        model_id: &str,
+        mut refusal: Response,
+    ) -> Response {
+        if error::extract_error_code_from_response(&refusal) != placement::NO_AVAILABLE_WORKERS_CODE
+        {
+            return refusal;
+        }
+        refusal.extensions_mut().insert(ReportedRefusal);
+        if let Some(admitted) = throttle.admit(model_id) {
+            let pool = self.pool_state(model_id);
+            warn!(
+                function,
+                request_id = request_id,
+                mode = ?self.mode,
+                model_id = %model_id,
+                workers = pool.workers(),
+                available = pool.available(),
+                pool = %pool,
+                suppressed = admitted.suppressed,
+                "No available workers for model"
+            );
+        }
+        refusal
+    }
+
+    /// The pools the stage's mode draws from for `model_id`, as the refusal
+    /// line reports them.
+    fn pool_state(&self, model_id: &str) -> PoolState {
+        let legs: &[(&'static str, RoutingPool)] = match self.mode {
+            WorkerSelectionMode::Regular => &[("regular", RoutingPool::GrpcPipelineRegular)],
+            WorkerSelectionMode::PrefillDecode => &[
+                ("prefill", RoutingPool::GrpcPrefill),
+                ("decode", RoutingPool::GrpcDecode),
+            ],
+            WorkerSelectionMode::EncodePrefillDecode => &[
+                ("encode", RoutingPool::GrpcEncode),
+                ("prefill", RoutingPool::GrpcPrefill),
+                ("decode", RoutingPool::GrpcDecode),
+            ],
+        };
+        PoolState {
+            legs: legs
+                .iter()
+                .map(|(leg, pool)| {
+                    let workers = self.worker_registry.get_routing_pool(model_id, *pool);
+                    LegState {
+                        leg,
+                        workers: workers.len(),
+                        healthy: workers.iter().filter(|w| w.is_healthy()).count(),
+                        available: workers.iter().filter(|w| w.is_available()).count(),
+                    }
+                })
+                .collect(),
+        }
     }
 
     /// The response for a failed pair placement. The verdict was judged from
@@ -872,7 +1052,7 @@ impl WorkerSelectionStage {
             // Admission turns a capacity verdict into a wait before it gets here.
             PlacementFailure::Unavailable
             | PlacementFailure::PolicyDeclined(_)
-            | PlacementFailure::PrefillAtCapacity => self.workers_unavailable(model_id),
+            | PlacementFailure::PrefillAtCapacity => Self::workers_unavailable(model_id),
             PlacementFailure::NoCompatiblePair {
                 prefill,
                 decode,
@@ -1357,7 +1537,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, time::Duration};
+    use std::{
+        collections::HashMap,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
 
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use llm_tokenizer::TokenizerRegistry;
@@ -2179,6 +2363,7 @@ mod tests {
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
             root_request_id: None,
+            request_id: None,
             cache_trace: None,
             attempt: 0,
             ledger: AttemptLedger::default(),
@@ -3657,5 +3842,121 @@ mod tests {
         );
         assert!(!holds_claim, "the prefill claim went back");
         assert_eq!(prefill.load(), 0, "no load left on the prefill worker");
+    }
+
+    // ---- the refusal line of a drained pool -------------------------------------------------
+
+    /// Counts, on this thread's subscriber, the ERROR events and the stage's
+    /// refusal lines (the events carrying a `suppressed` field).
+    struct RefusalLineCounter {
+        errors: Arc<AtomicUsize>,
+        refusal_lines: Arc<AtomicUsize>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalLineCounter {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::ERROR {
+                self.errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if event.metadata().fields().field("suppressed").is_some() {
+                self.refusal_lines.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// A model whose only worker is down is refused with the
+    /// `no_available_workers` 503, marked as reported for the loggers
+    /// downstream, and written at WARN exactly up to the per-second
+    /// allowance of its own, never at ERROR: three ERROR lines per refusal
+    /// made a client's retry loop against a drained pool a log storm, and a
+    /// second model down at the same time still gets its own lines.
+    #[tokio::test]
+    async fn a_refusal_for_a_drained_pool_is_marked_and_written_at_warn_within_the_allowance() {
+        use openai_protocol::worker::WorkerStatus;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::Registry::default().with(RefusalLineCounter {
+                errors: Arc::clone(&errors),
+                refusal_lines: Arc::clone(&refusal_lines),
+            }),
+        );
+        let registry = Arc::new(WorkerRegistry::new());
+        let down = worker("grpc://127.0.0.1:30010", WorkerType::Regular);
+        down.set_status(WorkerStatus::NotReady);
+        registry.register(down).unwrap();
+        let stage = regular_stage(Arc::clone(&registry));
+        let allowance = usize::try_from(NO_AVAILABLE_WORKERS_LINES_PER_SECOND).unwrap();
+
+        // The stage's entry point marks and reports the refusal.
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        let refused = stage
+            .execute(&mut ctx)
+            .await
+            .expect_err("no worker is available");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert!(
+            refused.extensions().get::<ReportedRefusal>().is_some(),
+            "the refusal is marked as reported, so the pipeline and the access log keep quiet"
+        );
+
+        // Under a throttle of its own (the process-wide one is shared with
+        // every other test), the lines are exactly the allowance per model.
+        let throttle = KeyedLogThrottle::new(
+            NO_AVAILABLE_WORKERS_LINES_PER_SECOND,
+            Duration::from_secs(60),
+            NO_AVAILABLE_WORKERS_LOG_MODELS,
+        );
+        refusal_lines.store(0, Ordering::Relaxed);
+        let refusals = 5 * allowance;
+        for _ in 0..refusals {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            let refused = stage
+                .select(&mut ctx)
+                .await
+                .expect_err("no worker is available");
+            let reported = stage.report_refusal_with(
+                &throttle,
+                "WorkerSelectionStage::execute",
+                None,
+                "test-model",
+                refused,
+            );
+            assert!(reported.extensions().get::<ReportedRefusal>().is_some());
+        }
+        assert_eq!(
+            refusal_lines.load(Ordering::Relaxed),
+            allowance,
+            "{refusals} refusals of one model inside one window write exactly {allowance} lines"
+        );
+        for _ in 0..refusals {
+            stage.report_refusal_with(
+                &throttle,
+                "WorkerSelectionStage::reselect",
+                Some("req-other"),
+                "other-model",
+                WorkerSelectionStage::workers_unavailable("other-model"),
+            );
+        }
+        assert_eq!(
+            refusal_lines.load(Ordering::Relaxed),
+            2 * allowance,
+            "a second model down at the same time gets its own {allowance} lines"
+        );
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "a refusal is not an error of the gateway"
+        );
     }
 }

@@ -28,7 +28,7 @@ use openai_protocol::{
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::error;
+use tracing::{debug, error};
 
 use super::{
     common::{
@@ -71,7 +71,7 @@ use super::{
 };
 use crate::{
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -459,7 +459,17 @@ impl RequestPipeline {
         macro_rules! step {
             ($stage:expr, $result:expr) => {
                 $result.inspect_err(|response: &Response| {
-                    error!("Stage {} failed with status {}", $stage, response.status());
+                    if response.extensions().get::<ReportedRefusal>().is_some() {
+                        // The stage wrote the one line this refusal gets
+                        // (rate-limited, with the pool's state).
+                        debug!(
+                            "Stage {} refused the request with status {}",
+                            $stage,
+                            response.status()
+                        );
+                    } else {
+                        error!("Stage {} failed with status {}", $stage, response.status());
+                    }
                 })
             };
         }
@@ -698,11 +708,21 @@ impl RequestPipeline {
             };
 
             self.record_error(metrics_endpoint, &dctx.model_id, &failure);
-            error!(
-                attempt,
-                status = %failure.status(),
-                "pipeline attempt failed"
-            );
+            if failure.extensions().get::<ReportedRefusal>().is_some() {
+                // The re-selection wrote this refusal's line (rate-limited,
+                // with the pool's state), as for the first selection.
+                debug!(
+                    attempt,
+                    status = %failure.status(),
+                    "pipeline attempt refused"
+                );
+            } else {
+                error!(
+                    attempt,
+                    status = %failure.status(),
+                    "pipeline attempt failed"
+                );
+            }
             // The failed attempt's worker load must not stay elevated through
             // the backoff window (a fresh context dropped them here before).
             // This releases its PD admission claim too, so the retry is not
