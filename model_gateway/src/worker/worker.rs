@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::VecDeque,
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, AtomicUsize, Ordering},
@@ -441,7 +442,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// implementations that carry no shared runtime (the language bindings,
     /// test doubles): the gate only reaches a worker that reports a running
     /// window, and any implementation that does report one must override
-    /// these three with a real claim, or the window is not enforced.
+    /// these three with a real claim, or the window is not enforced (and
+    /// the three queue methods after them with a real order, or the wait
+    /// is not first come, first served).
     fn try_admit_pd(&self, _count: usize, _window: usize) -> bool {
         true
     }
@@ -452,6 +455,33 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Rooms currently claimed on this worker.
     fn pd_admitted(&self) -> usize {
         0
+    }
+
+    /// Take a place at the back of this worker's admission queue for a
+    /// dispatch that needs `rooms`. The gate lets it claim only while no older
+    /// place needs as few rooms ([`Worker::pd_may_claim`]), which is what
+    /// hands a freed room to the request that has waited longest for one;
+    /// the place is given back through [`Worker::pd_dequeue`] however the
+    /// wait ends.
+    fn pd_enqueue(&self, _rooms: usize) -> u64 {
+        0
+    }
+
+    /// Whether `place` may claim: no older place still waiting needs as few
+    /// rooms as it does, or fewer. The default never queues, so it always may.
+    fn pd_may_claim(&self, _place: u64) -> bool {
+        true
+    }
+
+    /// Give `place` back, whether its dispatch claimed, was shed, or stopped
+    /// waiting early; the places behind it move up.
+    fn pd_dequeue(&self, _place: u64) {}
+
+    /// The notifier of `place`, fired when it is worth trying again: rooms
+    /// were released, or a place ahead of it left. `None` (the default, or a
+    /// place already given back) leaves the gate to its retry interval.
+    fn pd_wake(&self, _place: u64) -> Option<Arc<Notify>> {
+        None
     }
 
     /// Get the current routing-key load cardinality.
@@ -1382,6 +1412,13 @@ pub struct WorkerRuntime {
     /// the over-window burst the gate exists to prevent. Lives here so a
     /// same-URL replacement inherits the rooms the engine still holds.
     pd_admitted: AtomicUsize,
+    /// The dispatches waiting at the PD admission gate for this worker's
+    /// rooms, oldest first, so a room that frees goes to the one that has
+    /// waited longest for it (see [`Self::pd_enqueue`]), each with the
+    /// notifier its wait sleeps on. Kept with the rooms rather than in a
+    /// registry of its own: the order lives and dies with the worker, and a
+    /// same-URL replacement inherits it with them.
+    pd_queue: Mutex<PdQueue>,
     processed_counter: AtomicUsize,
     worker_routing_key_load: WorkerRoutingKeyLoad,
     revision: AtomicU64,
@@ -1585,6 +1622,59 @@ impl PrefillBook {
     }
 }
 
+/// The PD admission gate's queue on one worker (see [`Worker::pd_enqueue`]):
+/// the places outstanding, oldest first, each with the rooms it needs and
+/// the notifier its wait sleeps on, and the next place number to hand out. A
+/// place is handed out and queued under the one lock, so the queue is always
+/// in arrival order.
+#[derive(Debug, Default)]
+struct PdQueue {
+    next: u64,
+    waiting: VecDeque<PdPlace>,
+}
+
+#[derive(Debug)]
+struct PdPlace {
+    place: u64,
+    rooms: usize,
+    wake: Arc<Notify>,
+}
+
+impl PdQueue {
+    /// Whether `place` may claim: no older place needs as few rooms as it
+    /// does, or fewer. Requests of a size are served in arrival order, and a
+    /// request that needs more rooms than the ones behind it never idles the
+    /// window waiting for them to free all at once: they pass it, and it
+    /// claims when its rooms are free together, as it did before the queue
+    /// existed. A place that is not queued may not claim.
+    fn may_claim(&self, place: u64) -> bool {
+        let mut fewest_ahead = usize::MAX;
+        for waiting in &self.waiting {
+            if waiting.place == place {
+                return waiting.rooms < fewest_ahead;
+            }
+            fewest_ahead = fewest_ahead.min(waiting.rooms);
+        }
+        false
+    }
+
+    /// The notifiers of the places that may claim now (see
+    /// [`Self::may_claim`]): the front, and behind it each place that needs
+    /// fewer rooms than every place ahead of it. Woken when rooms are
+    /// released and when one of them leaves; the others have nothing to try.
+    fn claimable_wakes(&self) -> Vec<Arc<Notify>> {
+        let mut fewest_ahead = usize::MAX;
+        let mut wakes = Vec::new();
+        for waiting in &self.waiting {
+            if waiting.rooms < fewest_ahead {
+                wakes.push(Arc::clone(&waiting.wake));
+                fewest_ahead = waiting.rooms;
+            }
+        }
+        wakes
+    }
+}
+
 impl WorkerRuntime {
     pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
         Self {
@@ -1598,6 +1688,7 @@ impl WorkerRuntime {
             total_pending_probes: AtomicUsize::new(0),
             load_counter: AtomicUsize::new(0),
             pd_admitted: AtomicUsize::new(0),
+            pd_queue: Mutex::new(PdQueue::default()),
             processed_counter: AtomicUsize::new(0),
             worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
             revision: AtomicU64::new(0),
@@ -1913,13 +2004,85 @@ impl WorkerRuntime {
             .is_ok()
     }
 
-    /// Release `count` claimed rooms, saturating at zero.
+    /// Release `count` claimed rooms, saturating at zero, and wake the waits
+    /// that may claim now.
     pub fn release_pd(&self, count: usize) {
         let _ = self
             .pd_admitted
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |admitted| {
                 Some(admitted.saturating_sub(count))
             });
+        self.wake_claimable();
+    }
+
+    /// Wake the places that may claim now; the others would find nothing to
+    /// do. One wakeup per such place, not one per waiter: `notify_one` keeps
+    /// a permit for a wait that is between tries, so none is lost.
+    fn wake_claimable(&self) {
+        let wakes = self.pd_queue.lock().claimable_wakes();
+        for wake in wakes {
+            wake.notify_one();
+        }
+    }
+
+    /// Join the admission queue at the back, needing `rooms`; the place comes
+    /// back through [`Self::pd_dequeue`] on every way out of the wait.
+    pub fn pd_enqueue(&self, rooms: usize) -> u64 {
+        let mut queue = self.pd_queue.lock();
+        let place = queue.next;
+        queue.next += 1;
+        queue.waiting.push_back(PdPlace {
+            place,
+            rooms,
+            wake: Arc::new(Notify::new()),
+        });
+        place
+    }
+
+    /// Whether `place` may claim: no older place still waiting needs as few
+    /// rooms as it does, or fewer (see [`PdQueue::may_claim`]).
+    pub fn pd_may_claim(&self, place: u64) -> bool {
+        self.pd_queue.lock().may_claim(place)
+    }
+
+    /// Leave the queue from wherever the place is: after a claim or the shed,
+    /// or when a dispatch stops waiting early. The places behind move up; a
+    /// place already gone is a no-op. Only a place that could claim held any
+    /// other back, so only then are the places that may claim now woken. The
+    /// scans are linear in the queue, which holds only the dispatches waiting
+    /// on this worker now.
+    pub fn pd_dequeue(&self, place: u64) {
+        let wakes = {
+            let mut queue = self.pd_queue.lock();
+            let Some(at) = queue
+                .waiting
+                .iter()
+                .position(|waiting| waiting.place == place)
+            else {
+                return;
+            };
+            let could_claim = queue.may_claim(place);
+            queue.waiting.remove(at);
+            if could_claim {
+                queue.claimable_wakes()
+            } else {
+                Vec::new()
+            }
+        };
+        for wake in wakes {
+            wake.notify_one();
+        }
+    }
+
+    /// The notifier of `place` (see [`Worker::pd_wake`]); `None` once the
+    /// place is given back.
+    pub fn pd_wake(&self, place: u64) -> Option<Arc<Notify>> {
+        self.pd_queue
+            .lock()
+            .waiting
+            .iter()
+            .find(|waiting| waiting.place == place)
+            .map(|waiting| Arc::clone(&waiting.wake))
     }
 
     // ── Routing-key load ────────────────────────────────────────────
@@ -2355,6 +2518,22 @@ impl Worker for BasicWorker {
 
     fn pd_admitted(&self) -> usize {
         self.runtime.load().pd_admitted()
+    }
+
+    fn pd_enqueue(&self, rooms: usize) -> u64 {
+        self.runtime.load().pd_enqueue(rooms)
+    }
+
+    fn pd_may_claim(&self, place: u64) -> bool {
+        self.runtime.load().pd_may_claim(place)
+    }
+
+    fn pd_dequeue(&self, place: u64) {
+        self.runtime.load().pd_dequeue(place);
+    }
+
+    fn pd_wake(&self, place: u64) -> Option<Arc<Notify>> {
+        self.runtime.load().pd_wake(place)
     }
 
     fn routing_key_load(&self) -> usize {
@@ -3245,6 +3424,95 @@ mod tests {
 
         assert_eq!(admitted, window, "exactly the window's worth may claim");
         assert_eq!(worker.pd_admitted(), window);
+    }
+
+    #[test]
+    fn test_pd_admission_queue_is_arrival_ordered_and_closes_over_departures() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        let (first, second, third) = (
+            worker.pd_enqueue(1),
+            worker.pd_enqueue(1),
+            worker.pd_enqueue(1),
+        );
+        assert!(worker.pd_may_claim(first), "the oldest place is next");
+        assert!(!worker.pd_may_claim(second));
+        assert!(!worker.pd_may_claim(third));
+        assert!(
+            worker.pd_wake(second).is_some(),
+            "a queued place has its notifier"
+        );
+
+        // A dispatch that stops waiting from the middle leaves no hole.
+        worker.pd_dequeue(second);
+        assert!(worker.pd_may_claim(first));
+        assert!(
+            worker.pd_wake(second).is_none(),
+            "a place given back has none"
+        );
+        worker.pd_dequeue(first);
+        assert!(worker.pd_may_claim(third), "the places behind move up");
+        assert!(
+            !worker.pd_may_claim(second),
+            "a place given back never comes back"
+        );
+
+        // Leaving twice, or with a place never handed out, changes nothing.
+        worker.pd_dequeue(second);
+        worker.pd_dequeue(u64::MAX);
+        assert!(worker.pd_may_claim(third));
+
+        worker.pd_dequeue(third);
+        assert!(
+            worker.pd_may_claim(worker.pd_enqueue(1)),
+            "with nobody waiting a newcomer is next at once"
+        );
+    }
+
+    #[test]
+    fn test_pd_admission_queue_lets_a_narrower_place_pass_a_wider_older_one() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        // Arrival order, with the rooms each needs: 4, 1, 2, 1, 3.
+        let wide = worker.pd_enqueue(4);
+        let narrow = worker.pd_enqueue(1);
+        let middle = worker.pd_enqueue(2);
+        let narrow_too = worker.pd_enqueue(1);
+        let wider = worker.pd_enqueue(3);
+        assert!(worker.pd_may_claim(wide), "the front always may");
+        assert!(
+            worker.pd_may_claim(narrow),
+            "it needs fewer rooms than everyone ahead of it"
+        );
+        assert!(
+            !worker.pd_may_claim(middle),
+            "the 1-room place ahead goes first"
+        );
+        assert!(
+            !worker.pd_may_claim(narrow_too),
+            "its equal ahead goes first"
+        );
+        assert!(!worker.pd_may_claim(wider));
+
+        // The narrow one is served: the 2-room place now needs fewer than the
+        // front, and the other 1-room place fewer than both ahead of it.
+        worker.pd_dequeue(narrow);
+        assert!(worker.pd_may_claim(wide));
+        assert!(worker.pd_may_claim(middle));
+        assert!(worker.pd_may_claim(narrow_too));
+        assert!(!worker.pd_may_claim(wider), "a 1-room place is still ahead");
+
+        // The wide front leaves (shed, or its rooms freed together).
+        worker.pd_dequeue(wide);
+        assert!(worker.pd_may_claim(middle));
+        assert!(worker.pd_may_claim(narrow_too));
+        assert!(!worker.pd_may_claim(wider));
+
+        worker.pd_dequeue(middle);
+        worker.pd_dequeue(narrow_too);
+        assert!(worker.pd_may_claim(wider), "last in line, and alone");
     }
 
     #[test]
