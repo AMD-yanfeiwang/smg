@@ -439,10 +439,10 @@ impl ConversationStorage for PostgresConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
         execute_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ConversationStorageError::from_pg)?;
         Ok(conversation)
     }
 
@@ -475,10 +475,10 @@ impl ConversationStorage for PostgresConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
         let rows = query_cached(&client, &sql, &[&id.0.as_str()])
             .await
-            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ConversationStorageError::from_pg)?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -543,11 +543,11 @@ impl ConversationStorage for PostgresConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
         let sql = format!("UPDATE {table} SET {col_meta} = $1 WHERE {col_id} = $2");
         let rows_affected = execute_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
             .await
-            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ConversationStorageError::from_pg)?;
         if rows_affected == 0 {
             return Ok(None);
         }
@@ -567,14 +567,14 @@ impl ConversationStorage for PostgresConversationStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
         let rows_deleted = execute_cached(
             &client,
             &format!("DELETE FROM {table} WHERE {col_id} = $1"),
             &[&id.0.as_str()],
         )
         .await
-        .map_err(|e| ConversationStorageError::StorageError(describe_error(&e)))?;
+        .map_err(ConversationStorageError::from_pg)?;
         Ok(rows_deleted > 0)
     }
 }
@@ -730,10 +730,10 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         execute_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ConversationItemStorageError::from_pg)?;
         Ok(ConversationItem {
             id,
             response_id,
@@ -777,10 +777,10 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         execute_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ConversationItemStorageError::from_pg)?;
         Ok(())
     }
 
@@ -804,28 +804,29 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
         let limit: i64 = params.limit as i64;
         let order_desc = matches!(params.order, SortOrder::Desc);
 
-        let after_key: Option<(DateTime<Utc>, String)> =
-            if let Some(ref aid) = params.after {
-                let client =
-                    self.store.pool.get().await.map_err(|e| {
-                        ConversationItemStorageError::StorageError(describe_error(&e))
-                    })?;
-                let cursor_sql = format!(
+        let after_key: Option<(DateTime<Utc>, String)> = if let Some(ref aid) = params.after {
+            let client = self
+                .store
+                .pool
+                .get()
+                .await
+                .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+            let cursor_sql = format!(
                 "SELECT {l_added_at} FROM {links_table} WHERE {l_conv_id} = $1 AND {l_item_id} = $2"
             );
-                let rows = query_cached(&client, &cursor_sql, &[&cid, &aid.as_str()])
-                    .await
-                    .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
-                if rows.is_empty() {
-                    None
-                } else {
-                    let row = &rows[0];
-                    let ts: DateTime<Utc> = row.get(0);
-                    Some((ts, aid.clone()))
-                }
-            } else {
+            let rows = query_cached(&client, &cursor_sql, &[&cid, &aid.as_str()])
+                .await
+                .map_err(ConversationItemStorageError::from_pg)?;
+            if rows.is_empty() {
                 None
-            };
+            } else {
+                let row = &rows[0];
+                let ts: DateTime<Utc> = row.get(0);
+                Some((ts, aid.clone()))
+            }
+        } else {
+            None
+        };
 
         // Build select columns from items table (prefixed with i.), respecting skip_columns
         let mut select_cols = vec![format!("i.{}", si.col("id"))];
@@ -878,15 +879,15 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         let rows = if let Some((ts, iid)) = &after_key {
             query_cached(&client, &sql, &[&cid, ts, iid, &limit])
                 .await
-                .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?
+                .map_err(ConversationItemStorageError::from_pg)?
         } else {
             query_cached(&client, &sql, &[&cid, &limit])
                 .await
-                .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?
+                .map_err(ConversationItemStorageError::from_pg)?
         };
 
         let mut out = Vec::new();
@@ -929,10 +930,10 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         let rows = query_cached(&client, &sql, &[&item_id.0.as_str()])
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ConversationItemStorageError::from_pg)?;
         if rows.is_empty() {
             Ok(None)
         } else {
@@ -957,14 +958,14 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         let row = query_one_cached(
             &client,
             &sql,
             &[&conversation_id.0.as_str(), &item_id.0.as_str()],
         )
         .await
-        .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        .map_err(ConversationItemStorageError::from_pg)?;
         let count: i64 = row.get(0);
         Ok(count > 0)
     }
@@ -986,14 +987,14 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
         execute_cached(
             &client,
             &sql,
             &[&conversation_id.0.as_str(), &item_id.0.as_str()],
         )
         .await
-        .map_err(|e| ConversationItemStorageError::StorageError(describe_error(&e)))?;
+        .map_err(ConversationItemStorageError::from_pg)?;
         Ok(())
     }
 }
@@ -1080,7 +1081,7 @@ impl PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
         let store_path = store_path_for(&client, &table, s.col("id")).await;
         let select_base = build_response_select_base(&store.schema);
         Ok(Self {
@@ -1513,9 +1514,8 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
-        let store_err =
-            |e: tokio_postgres::Error| ResponseStorageError::StorageError(describe_error(&e));
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let store_err = ResponseStorageError::from_pg;
         // The statement is prepared once per pooled connection (the cache
         // keeps it), so a store on the upsert path is one round trip.
         let rows = match self.store_path {
@@ -1569,10 +1569,10 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
         let rows = query_cached(&client, &sql, &[&response_id.0.as_str()])
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ResponseStorageError::from_pg)?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -1592,10 +1592,10 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
         let rows = query_cached(&client, &sql, &[&item_id])
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ResponseStorageError::from_pg)?;
         match rows.first() {
             Some(row) => Self::build_response_from_row(row, &self.store.schema).map(Some),
             None => Ok(None),
@@ -1612,14 +1612,14 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
         execute_cached(
             &client,
             &format!("DELETE FROM {table} WHERE {col_id} = $1"),
             &[&response_id.0.as_str()],
         )
         .await
-        .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+        .map_err(ResponseStorageError::from_pg)?;
         Ok(())
     }
 
@@ -1658,10 +1658,10 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
         let rows = query_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ResponseStorageError::from_pg)?;
 
         let schema = &self.store.schema;
         let mut out = Vec::with_capacity(rows.len());
@@ -1738,10 +1738,10 @@ impl ResponseStorage for PostgresResponseStorage {
             .pool
             .get()
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
         let rows_deleted = execute_cached(&client, &sql, &params)
             .await
-            .map_err(|e| ResponseStorageError::StorageError(describe_error(&e)))?;
+            .map_err(ResponseStorageError::from_pg)?;
         Ok(rows_deleted as usize)
     }
 }
