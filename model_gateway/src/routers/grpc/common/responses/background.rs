@@ -394,6 +394,28 @@ fn retire_unstored(
     let storage = Arc::clone(storage);
     let id = id.to_string();
     tokio::spawn(async move {
+        // A store that keeps deadlines drops the record itself should this
+        // gateway be gone before the window ends; the stores that keep none
+        // are swept (see [`sweep_unstored`]).
+        let expire = async {
+            storage
+                .expire_response(&ResponseId::from(id.as_str()), UNSTORED_RETENTION)
+                .await
+        };
+        let expired = match request_context.clone() {
+            Some(ctx) => with_request_context(ctx, expire).await,
+            None => expire.await,
+        };
+        // The default answers Ok for a store that keeps no deadline: an error
+        // is a store that keeps them and failed to set one, which leaves this
+        // gateway's timer as the record's only retirement.
+        if let Err(e) = expired {
+            warn!(
+                response_id = %id,
+                error = %e,
+                "Failed to set the store's deadline on the unstored background response record; only this gateway's timer retires it"
+            );
+        }
         tokio::time::sleep(UNSTORED_RETENTION).await;
         let delete = async {
             storage
@@ -416,6 +438,57 @@ fn retire_unstored(
             ),
         }
     });
+}
+
+/// Deletes the records of unstored background responses whose polling window
+/// ended with no gateway there to retire them: a gateway stopped or lost
+/// inside the window, with a store that outlives the process. Returns how
+/// many records went. A store that keeps no query over the stored object
+/// answers 0 (see `ResponseStorage::delete_unstored_older_than`).
+pub(crate) async fn sweep_unstored(storage: &Arc<dyn ResponseStorage>) -> usize {
+    let window =
+        chrono::Duration::seconds(i64::try_from(UNSTORED_RETENTION.as_secs()).unwrap_or(i64::MAX));
+    match storage
+        .delete_unstored_older_than(chrono::Utc::now() - window)
+        .await
+    {
+        Ok(0) => 0,
+        Ok(deleted) => {
+            info!(
+                deleted,
+                "Retired the unstored background response records left past their polling window"
+            );
+            deleted
+        }
+        Err(e) => {
+            warn!(error = %e, "Failed to sweep the unstored background response records");
+            0
+        }
+    }
+}
+
+/// Runs [`sweep_unstored`] now, for the records an earlier gateway left in a
+/// store that outlives it, whatever this gateway's background setting; then,
+/// when `repeat` says so, once per polling window for the life of the gateway
+/// (background mode on: new unstored records can appear; off, none can, and
+/// the one sweep at start-up is all the store needs).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a periodic sweep over the store for the gateway's lifetime; nothing waits on it at shutdown"
+)]
+pub(crate) fn spawn_unstored_sweeper(
+    storage: Arc<dyn ResponseStorage>,
+    repeat: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            sweep_unstored(&storage).await;
+            if !repeat {
+                return;
+            }
+            tokio::time::sleep(UNSTORED_RETENTION).await;
+        }
+    })
 }
 
 /// [`set_stored_status`] retried every `every` within `window` while the store
@@ -1711,6 +1784,88 @@ mod tests {
             .status(ResponseStatus::Completed)
             .add_output(message)
             .build()
+    }
+
+    /// With background mode off the sweeper still runs once at start-up, for
+    /// the records an earlier gateway left, and then ends.
+    #[tokio::test]
+    async fn the_sweeper_runs_once_with_background_mode_off() {
+        let storage = storage();
+        let mut left = StoredResponse::new(None);
+        left.id = ResponseId::from("resp_left");
+        left.raw_response = json!({
+            "id": "resp_left",
+            "store": false,
+            "status": "completed",
+            "completed_at": chrono::Utc::now().timestamp() - 3 * UNSTORED_RETENTION.as_secs() as i64,
+        });
+        storage.store_response(left).await.unwrap();
+
+        spawn_unstored_sweeper(Arc::clone(&storage), false)
+            .await
+            .expect("the one-shot sweeper ends");
+
+        assert!(storage
+            .get_response(&ResponseId::from("resp_left"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The sweep takes the unstored records whose window ended and leaves a
+    /// fresh one, a stored one and one still running.
+    #[tokio::test]
+    async fn the_sweep_retires_the_unstored_records_left_past_their_window() {
+        use smg_data_connector::{MemoryResponseStorage, StoredResponse};
+
+        let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let now = chrono::Utc::now().timestamp();
+        let past = now - i64::try_from(UNSTORED_RETENTION.as_secs()).unwrap() - 60;
+        for (id, raw) in [
+            (
+                "resp_old_unstored",
+                json!({"status": "completed", "store": false, "completed_at": past}),
+            ),
+            (
+                "resp_fresh_unstored",
+                json!({"status": "completed", "store": false, "completed_at": now}),
+            ),
+            (
+                "resp_old_stored",
+                json!({"status": "completed", "store": true, "completed_at": past}),
+            ),
+            (
+                "resp_old_running_unstored",
+                json!({"status": "in_progress", "store": false}),
+            ),
+        ] {
+            let mut stored = StoredResponse::new(None);
+            stored.id = ResponseId::from(id);
+            stored.raw_response = raw;
+            storage.store_response(stored).await.unwrap();
+        }
+
+        assert_eq!(sweep_unstored(&storage).await, 1);
+
+        assert!(storage
+            .get_response(&ResponseId::from("resp_old_unstored"))
+            .await
+            .unwrap()
+            .is_none());
+        for kept in [
+            "resp_fresh_unstored",
+            "resp_old_stored",
+            "resp_old_running_unstored",
+        ] {
+            assert!(
+                storage
+                    .get_response(&ResponseId::from(kept))
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{kept}"
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]

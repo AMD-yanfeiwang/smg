@@ -144,6 +144,40 @@ impl PostgresStore {
                 schema_version = POSTGRES_HISTORY_MIGRATIONS.last().map_or(0, |m| m.version),
                 "fresh database: history tables created at the latest schema version"
             );
+            // The unstored-record index is built here, on the table just created
+            // and still empty: on a populated table the build would hold a share
+            // lock on it inside this transaction, blocking every replica's writes
+            // and the other gateways waiting on the schema lock. An existing
+            // table gets it from its operator, concurrently (see the release
+            // note); the sweep works without it, as a scan.
+            if let Some(index_ddl) = PostgresResponseStorage::unstored_index_ddl(schema) {
+                let index = tx.savepoint("unstored_index").await.map_err(|e| {
+                    format!(
+                        "failed to open the unstored index savepoint: {}",
+                        describe_error(&e)
+                    )
+                })?;
+                match index.batch_execute(&index_ddl).await {
+                    Ok(()) => index.commit().await.map_err(|e| {
+                        format!(
+                            "failed to release the unstored index savepoint: {}",
+                            describe_error(&e)
+                        )
+                    })?,
+                    Err(e) => {
+                        tracing::warn!(
+                            "unstored response index not created (the sweep of unstored background records scans the table): {}",
+                            describe_error(&e)
+                        );
+                        index.rollback().await.map_err(|e| {
+                            format!(
+                                "failed to roll back the unstored index savepoint: {}",
+                                describe_error(&e)
+                            )
+                        })?;
+                    }
+                }
+            }
         } else {
             run_postgres_migrations(
                 &tx,
@@ -1069,6 +1103,22 @@ impl PostgresResponseStorage {
         ))
     }
 
+    /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
+    /// object's status, over the unstored records only, so a sweep reads
+    /// those rows and no other. Its expressions are the sweep's predicate.
+    pub(crate) fn unstored_index_ddl(schema: &SchemaConfig) -> Option<String> {
+        let s = &schema.responses;
+        if s.is_skipped("raw_response") {
+            return None;
+        }
+        let table = s.qualified_table(schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        Some(format!(
+            "CREATE INDEX IF NOT EXISTS responses_unstored_idx ON {table} (({col_raw}::jsonb->>'status')) \
+             WHERE ({col_raw}::jsonb->>'store') = 'false';"
+        ))
+    }
+
     pub fn build_response_from_row(
         row: &Row,
         schema: &SchemaConfig,
@@ -1533,6 +1583,45 @@ impl ResponseStorage for PostgresResponseStorage {
         }
 
         Ok(out)
+    }
+
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        let s = &self.store.schema.responses;
+
+        // The object (its `store`, `status` and `completed_at`) is what the
+        // query reads; without the column there is nothing to read.
+        if s.is_skipped("raw_response") {
+            return Ok(0);
+        }
+
+        let table = s.qualified_table(self.store.schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        let ended = if s.is_skipped("created_at") {
+            format!("({col_raw}::jsonb->>'completed_at')::bigint")
+        } else {
+            format!(
+                "COALESCE(({col_raw}::jsonb->>'completed_at')::bigint, EXTRACT(EPOCH FROM {})::bigint)",
+                s.col("created_at")
+            )
+        };
+        let sql = format!(
+            "DELETE FROM {table} WHERE {col_raw}::jsonb->>'store' = 'false' \
+             AND {col_raw}::jsonb->>'status' IN ('completed', 'incomplete', 'failed', 'cancelled') \
+             AND {ended} < $1"
+        );
+
+        let client = self
+            .store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        let cutoff_secs: i64 = cutoff.timestamp();
+        let rows_deleted = client
+            .execute(&sql, &[&cutoff_secs])
+            .await
+            .map_err(|e| ResponseStorageError::StorageError(e.to_string()))?;
+        Ok(rows_deleted as usize)
     }
 
     async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {

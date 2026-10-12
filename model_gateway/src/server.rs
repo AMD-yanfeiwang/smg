@@ -65,6 +65,7 @@ use crate::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
         gateway::Gateway,
+        grpc::common::responses::spawn_unstored_sweeper,
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
@@ -1698,6 +1699,17 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         // and therefore measures — the runtime that serves requests.
         runtime_metrics::spawn_observer();
     }
+
+    // The records of unstored background responses whose polling window
+    // ended with no gateway there to retire them (a stop or a crash inside
+    // the window, with a store that outlives the process) are swept now,
+    // whatever this gateway's background setting (an earlier one may have had
+    // it on), and then once per window while background mode is on, where new
+    // unstored records can appear. Dropping the JoinHandle detaches the task.
+    let _unstored_sweeper = spawn_unstored_sweeper(
+        app_context.response_storage.clone(),
+        config.router_config.max_background_responses > 0,
+    );
 
     // Optional isolated probe listener (additive): when `--health-check-port`
     // is set, serves /liveness, /readiness, /health on that port from a

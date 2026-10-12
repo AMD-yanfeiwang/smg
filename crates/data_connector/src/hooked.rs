@@ -611,6 +611,21 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    async fn expire_response(
+        &self,
+        response_id: &ResponseId,
+        after: std::time::Duration,
+    ) -> ResponseResult<()> {
+        self.inner.expire_response(response_id, after).await
+    }
+
+    /// Delegated without the hooks: the sweep is the store's own housekeeping
+    /// over records whose clients asked for nothing to be kept, and it names no
+    /// record before the store finds them, so no hook runs for its deletions.
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        self.inner.delete_unstored_older_than(cutoff).await
+    }
+
     async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
         let payload = serde_json::json!({ "identifier": identifier });
         let extra = run_before(

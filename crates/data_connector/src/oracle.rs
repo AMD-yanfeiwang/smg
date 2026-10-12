@@ -1215,6 +1215,31 @@ impl OracleResponseStorage {
                 &[],
             )
             .map_err(map_oracle_error)?;
+
+            // The index behind `delete_unstored_older_than`: the object's status
+            // over the unstored records only (NULL, hence absent, for the rest).
+            // Built with the table, while it is empty; an existing table gets it
+            // from its operator (see the release note), and a build that fails
+            // (a busy object, an identifier too long for the release, no
+            // temporary space) leaves the sweep a scan rather than failing the
+            // start, as on Postgres.
+            if !s.is_skipped("raw_response") {
+                let col_raw = s.col("raw_response");
+                let unstored_idx = format!("{}_UNSTORED_IDX", s.table);
+                if let Err(e) = create_index_if_missing(
+                    conn,
+                    &s.table,
+                    &unstored_idx,
+                    &format!(
+                        "CREATE INDEX {unstored_idx} ON {table}({})",
+                        unstored_status_expr(col_raw)
+                    ),
+                ) {
+                    tracing::warn!(
+                        "unstored response index not created (the sweep of unstored background records scans the table): {e}"
+                    );
+                }
+            }
         }
 
         if !s.is_skipped("previous_response_id") {
@@ -1551,6 +1576,56 @@ impl ResponseStorage for OracleResponseStorage {
             .map_err(ResponseStorageError::StorageError)
     }
 
+    async fn delete_unstored_older_than(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, ResponseStorageError> {
+        let schema = self.store.schema.clone();
+        // The object (its `store`, `status` and `completed_at`) is what the
+        // query reads; without the column there is nothing to read.
+        if schema.responses.is_skipped("raw_response") {
+            return Ok(0);
+        }
+        let cutoff_secs: i64 = cutoff.timestamp();
+
+        let affected = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                let table = s.qualified_table(schema.owner.as_deref());
+                let col_raw = s.col("raw_response");
+                let ended = if s.is_skipped("created_at") {
+                    format!("TO_NUMBER(JSON_VALUE({col_raw}, '$.completed_at'))")
+                } else {
+                    format!(
+                        "COALESCE(TO_NUMBER(JSON_VALUE({col_raw}, '$.completed_at')), \
+                         ROUND((CAST({} AS DATE) - DATE '1970-01-01') * 86400))",
+                        s.col("created_at")
+                    )
+                };
+
+                // The predicate is the expression the table's unstored index
+                // holds (see the bootstrap), so the sweep reads those rows only.
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE {} IN ('completed', 'incomplete', 'failed', 'cancelled') \
+                         AND {ended} < :1",
+                        unstored_status_expr(col_raw)
+                    ),
+                    &[&cutoff_secs],
+                )
+                .map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::StorageError)?;
+
+        let deleted = affected
+            .row_count()
+            .map_err(|e| ResponseStorageError::StorageError(map_oracle_error(e)))?
+            as usize;
+        Ok(deleted)
+    }
+
     async fn delete_identifier_responses(
         &self,
         identifier: &str,
@@ -1585,6 +1660,14 @@ impl ResponseStorage for OracleResponseStorage {
             as usize;
         Ok(deleted)
     }
+}
+
+/// The status of an unstored response object, NULL for a stored one: the
+/// expression the unstored index holds and the sweep's predicate reads.
+fn unstored_status_expr(col_raw: &str) -> String {
+    format!(
+        "CASE WHEN JSON_VALUE({col_raw}, '$.store') = 'false' THEN JSON_VALUE({col_raw}, '$.status') END"
+    )
 }
 
 fn create_index_if_missing(
