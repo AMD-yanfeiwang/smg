@@ -642,8 +642,16 @@ struct CliArgs {
     /// it makes progress. The bound stretches to the time its in-flight
     /// prompts may still need in prefill, up to 120 seconds. The pile is the
     /// streaming gRPC generations in flight; HTTP workers, PD legs and
-    /// non-streaming generations give no signal and never form one. 0
-    /// disables the rule.
+    /// non-streaming generations give no signal and never form one. The
+    /// same bound, read per request, is how long a prefill leg of a
+    /// disaggregated dispatch may produce nothing, with its worker answering
+    /// no other leg either, before its request fails over to another
+    /// prefill worker (or fails, when there is none); a leg queued on a
+    /// worker that keeps answering waits on. On the parallel dispatch shape
+    /// a prefill leg's first response also waits for the decode side (its
+    /// bootstrap, and KV pre-allocation under decode pressure), so the
+    /// threshold must cover that wait for a prefill worker with nothing
+    /// else to answer meanwhile. 0 disables both.
     #[arg(long, default_value_t = 3, help_heading = "Load Monitoring")]
     worker_wedge_secs: u64,
 
