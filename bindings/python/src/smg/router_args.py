@@ -1568,8 +1568,15 @@ class RouterArgs:
                 " for this many seconds; an open streaming response counts as in"
                 " flight. The bound starts with the connection's first request (a"
                 " connection that never sends one is bounded by"
-                " --header-read-timeout-secs alone). 0 keeps idle connections open"
-                " until the client closes them"
+                " --header-read-timeout-secs alone). Keep it above the idle"
+                " timeout of any proxy or load balancer in front of the gateway,"
+                " so that side closes an idle connection first; otherwise a"
+                " request can be sent on a connection the gateway is closing and"
+                " fail with a reset. A connection the proxy opened ahead of time"
+                " and never used is bounded by --header-read-timeout-secs"
+                " instead: keep the proxy's idle timeout under that too, or do"
+                " not pre-open. 0 keeps idle connections open until the client"
+                " closes them"
             ),
         )
         request_group.add_argument(
