@@ -3132,6 +3132,14 @@ impl ProtoStream {
         Ok(first)
     }
 
+    /// The worker this stream was dispatched to, when it is tracked.
+    pub fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        match self {
+            Self::Tracked(tracked) => Some(&tracked.worker),
+            _ => None,
+        }
+    }
+
     /// Get next item from stream
     pub async fn next(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let Self::Tracked(tracked) = self else {
@@ -3266,6 +3274,10 @@ impl FanoutChild for ProtoStream {
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
     }
+
+    fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        ProtoStream::worker(self)
+    }
 }
 
 /// What a fan-out needs from a child stream. Implemented by [`ProtoStream`];
@@ -3282,6 +3294,12 @@ pub trait FanoutChild: Send {
     /// Defer the child's abort-on-drop until its first response.
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
+
+    /// The one worker the child was dispatched to, when it is tracked; a
+    /// fan-out over several workers answers `None`.
+    fn worker(&self) -> Option<&Arc<dyn Worker>> {
+        None
+    }
 }
 
 /// One child per sample of an n>1 fan-out over rendezvous-room PD pairs.
