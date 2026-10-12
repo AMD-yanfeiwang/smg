@@ -70,6 +70,7 @@ async fn postgres_bundle(db_url: &str) -> Result<StorageBundle, String> {
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await
@@ -412,6 +413,7 @@ async fn configured_table_bundle(db_url: &str, table: &str) -> Result<StorageBun
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await
@@ -1040,6 +1042,7 @@ async fn six_gateways_start_together(
                 oracle: None,
                 postgres: Some(&postgres_cfg),
                 redis: None,
+                memory: None,
                 hook: None,
             })
             .await
@@ -1098,6 +1101,7 @@ async fn a_fresh_database_bootstraps_at_the_latest_version_without_auto_migrate(
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await;
@@ -1401,6 +1405,7 @@ async fn a_database_ahead_of_this_build_is_refused_at_startup() {
         oracle: None,
         postgres: Some(&allowed_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await
@@ -1481,6 +1486,7 @@ async fn a_store_that_stops_answering_fails_the_call_at_its_bound() {
         oracle: None,
         postgres: Some(&postgres_cfg),
         redis: None,
+        memory: None,
         hook: None,
     })
     .await

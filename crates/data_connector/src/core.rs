@@ -210,6 +210,12 @@ pub trait ConversationStorage: Send + Sync + 'static {
     ) -> ConversationResult<Option<Conversation>>;
 
     async fn delete_conversation(&self, id: &ConversationId) -> ConversationResult<bool>;
+
+    /// How many conversations the store holds, for a store that can tell
+    /// without a query (the in-memory backend); `None` otherwise.
+    fn stored_record_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 // ============================================================================
@@ -410,6 +416,12 @@ pub trait ConversationItemStorage: Send + Sync + 'static {
         conversation_id: &ConversationId,
         item_id: &ConversationItemId,
     ) -> ConversationItemResult<()>;
+
+    /// How many items the store holds, for a store that can tell without a
+    /// query (the in-memory backend); `None` otherwise.
+    fn stored_record_count(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Helper to build id prefix based on item_type
@@ -909,6 +921,12 @@ pub trait ResponseStorage: Send + Sync {
     async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
         let _ = cutoff;
         Ok(0)
+    }
+
+    /// How many responses the store holds, for a store that can tell without
+    /// a query (the in-memory backend); `None` otherwise.
+    fn stored_record_count(&self) -> Option<usize> {
+        None
     }
 }
 

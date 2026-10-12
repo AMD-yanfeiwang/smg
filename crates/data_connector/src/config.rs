@@ -19,6 +19,55 @@ pub enum HistoryBackend {
     Redis,
 }
 
+/// Bounds of the in-memory history backend. Its records live in the
+/// gateway's own memory, so it keeps at most `max_responses` stored responses
+/// and `max_items` conversation items and drops a record older than
+/// `retention_secs`: the oldest go first, checked on every write. The
+/// defaults hold a default deployment at a few hundred MB (a stored response
+/// of a short exchange takes about 12 KB, a conversation item about 1.5 KB).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Most stored responses kept; the oldest go first.
+    pub max_responses: usize,
+    /// Most conversation items kept; the oldest go first, unlinked from every
+    /// conversation that lists them.
+    pub max_items: usize,
+    /// How long a record is kept, in seconds; `None` (or 0) keeps a record
+    /// until a count bound drops it. Conversations follow the retention only,
+    /// counted from their last use (created, read or updated); a background
+    /// response still running is not dropped by a count bound.
+    pub retention_secs: Option<u64>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_responses: 10_000,
+            max_items: 100_000,
+            retention_secs: Some(24 * 60 * 60),
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_responses == 0 || self.max_items == 0 {
+            return Err(
+                "memory history: max_responses and max_items must be at least 1".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The retention as a duration; `None` for no retention.
+    pub fn retention(&self) -> Option<Duration> {
+        self.retention_secs
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+    }
+}
+
 /// Oracle history backend configuration
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OracleConfig {
