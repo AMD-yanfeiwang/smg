@@ -937,7 +937,9 @@ struct CliArgs {
     log_json: bool,
 
     // ==================== Prometheus Metrics ====================
-    /// Port to expose Prometheus metrics; 0 binds an OS-assigned ephemeral port
+    /// Port to expose Prometheus metrics. Each listener (--port,
+    /// --prometheus-port, --health-check-port, --mesh-port) needs its own
+    /// port.
     #[arg(long, default_value_t = 29000, help_heading = "Prometheus Metrics")]
     prometheus_port: u16,
 
@@ -1767,6 +1769,8 @@ impl CliArgs {
             });
         }
 
+        // The mesh port against the other listeners' is checked in
+        // `server::startup`, for every way the server configuration is built.
         let bind_addr = Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
         let (advertise_host, advertise_field) =
             if let Some(host) = self.mesh_advertise_host.as_deref() {
