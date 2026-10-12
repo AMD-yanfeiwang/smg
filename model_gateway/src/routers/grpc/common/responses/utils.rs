@@ -20,8 +20,9 @@ use super::background;
 use crate::{
     routers::{
         common::{
-            mcp_utils::ensure_request_mcp_client, openai_bridge,
-            persistence_utils::persist_conversation_items,
+            mcp_utils::ensure_request_mcp_client,
+            openai_bridge,
+            persistence_utils::{persist_conversation_items, PersistStep},
         },
         error,
     },
@@ -333,10 +334,11 @@ pub(crate) async fn persist_response_if_needed(
         }
         return;
     }
+    let background = original_request.background.unwrap_or(false);
     // A background response's record may have been closed while the work
     // ran (a cancel, here or on another gateway sharing the store): a
     // terminal record is not rewritten by a late result.
-    if original_request.background.unwrap_or(false)
+    if background
         && background::is_closed(&response_storage, &response.id, request_context.clone()).await
     {
         debug!(
@@ -346,24 +348,87 @@ pub(crate) async fn persist_response_if_needed(
         return;
     }
 
-    if let Ok(response_json) = to_value(response) {
-        if let Err(e) = persist_conversation_items(
-            conversation_storage,
-            conversation_item_storage,
-            response_storage,
+    let Ok(response_json) = to_value(response) else {
+        return;
+    };
+    // A background response's terminal write is retried at the status-watch
+    // cadence within the terminal write window while the store answers with
+    // an error: the result of a run that outlived a store blip is stored once
+    // the store is back. Only the write of the response record is retried:
+    // once it landed, the conversation linking runs once (as before), so a
+    // retry can neither store the record twice nor link the items twice. A
+    // foreground response is written once, as before: its client is waiting
+    // for the answer. A background stream attached through the Harmony paths
+    // receives its terminal event after this persist, so during a store
+    // outage that event can wait for up to the window; the regular streaming
+    // paths emit it first.
+    let every = background::STATUS_WATCH;
+    let deadline = tokio::time::Instant::now() + background::terminal_write_window(every);
+    let mut attempts = 0u32;
+    loop {
+        match persist_conversation_items(
+            conversation_storage.clone(),
+            conversation_item_storage.clone(),
+            response_storage.clone(),
             &response_json,
             original_request,
-            request_context,
+            request_context.clone(),
         )
         .await
         {
-            warn!("Failed to persist response: {}", e);
-        } else {
-            debug!("Persisted response: {}", response.id);
+            Ok(()) => {
+                debug!("Persisted response: {}", response.id);
+                return;
+            }
+            Err(e)
+                if background
+                    && e.step == PersistStep::ResponseRecord
+                    && e.retryable
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                if attempts == 0 {
+                    warn!(
+                        response_id = %response.id,
+                        error = %e,
+                        "Failed to persist the background response; retrying while the store is unreachable"
+                    );
+                } else {
+                    debug!(response_id = %response.id, attempts, error = %e, "The background response persist still fails");
+                }
+                attempts += 1;
+                tokio::time::sleep(every).await;
+                // A cancel that landed meanwhile wins: a closed record is not
+                // rewritten by the result that waited for the store.
+                if background::is_closed(&response_storage, &response.id, request_context.clone())
+                    .await
+                {
+                    debug!(
+                        response_id = %response.id,
+                        "Background response record was closed while its result waited for the store; the result is not stored"
+                    );
+                    return;
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.step,
+                    PersistStep::ConversationLookup | PersistStep::Linking
+                ) =>
+            {
+                warn!(
+                    response_id = %response.id,
+                    error = %e,
+                    "Response stored; its items were not linked into the conversation"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!("Failed to persist response: {}", e);
+                return;
+            }
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use openai_protocol::{
