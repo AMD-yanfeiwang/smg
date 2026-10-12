@@ -529,8 +529,11 @@ pub(crate) async fn set_stored_status_retrying(
 }
 
 /// Whether the record under `id` has reached a terminal status (closed by a
-/// cancel, here or on another gateway sharing the store); the result of a
-/// work that ends after that is not stored over it.
+/// cancel, here or on another gateway sharing the store) or is gone (deleted
+/// while the work ran, here or on another gateway); the result of a work that
+/// ends after that is not stored: a terminal record is not rewritten and a
+/// deleted one is not re-created. A store that cannot be read answers neither
+/// and leaves the record open: the caller's write finds out.
 pub(crate) async fn is_closed(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
@@ -541,10 +544,11 @@ pub(crate) async fn is_closed(
         Some(ctx) => with_request_context(ctx, read).await,
         None => read.await,
     };
-    matches!(
-        stored,
-        Ok(Some(stored)) if is_terminal(stored.raw_response["status"].as_str().unwrap_or(""))
-    )
+    match stored {
+        Ok(Some(stored)) => is_terminal(stored.raw_response["status"].as_str().unwrap_or("")),
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 /// Moves the record under `id` to the terminal `status` (see
@@ -744,7 +748,9 @@ pub(crate) fn spawn(
 /// with its error, or with a generic one when the work ended without
 /// storing a result or panicked; `cancelled` on a cancel here. A record
 /// closed on another gateway sharing the store (read every
-/// [`STATUS_WATCH`]) stops the work and is not written again.
+/// [`STATUS_WATCH`]) stops the work and is not written again; so does a
+/// record deleted while the work ran, which is not written back either: the
+/// delete holds.
 pub(crate) async fn drive<F>(
     storage: Arc<dyn ResponseStorage>,
     request_context: Option<StorageRequestContext>,
@@ -769,8 +775,22 @@ pub(crate) async fn drive_watching<F>(
 {
     let id = slot.id().to_string();
     let token = slot.cancel_token();
-    match set_stored_status(&storage, &id, "in_progress", None, request_context.clone()).await {
-        Ok(Transition::Moved(_)) => {}
+    // Whether the record was there when the work started; the watch learns
+    // it from its own reads as well, so a store blip at this transition does
+    // not disarm it. Only a record seen is a deletion when it is gone later:
+    // a store that never shows the record (no history backend, or a record
+    // deleted before the start) runs the work to its end as before and
+    // stores nothing over the missing record.
+    let record_seen = match set_stored_status(
+        &storage,
+        &id,
+        "in_progress",
+        None,
+        request_context.clone(),
+    )
+    .await
+    {
+        Ok(Transition::Moved(_)) => true,
         Ok(Transition::Terminal(raw)) => {
             info!(
                 response_id = %id,
@@ -781,13 +801,16 @@ pub(crate) async fn drive_watching<F>(
             return;
         }
         Ok(Transition::Missing) => {
-            warn!(response_id = %id, "No record stored under the background response id");
+            warn!(response_id = %id, "No record stored under the background response id; its work runs and its result is not stored");
+            false
         }
         Err(e) => {
             warn!(response_id = %id, error = %e, "Failed to mark the background response in progress");
+            false
         }
-    }
-    let closed_elsewhere = watch_stored_status(&storage, &id, request_context.clone(), watch);
+    };
+    let closed_elsewhere =
+        watch_stored_status(&storage, &id, request_context.clone(), watch, record_seen);
     let work = AssertUnwindSafe(work).catch_unwind();
     tokio::select! {
         biased;
@@ -814,7 +837,7 @@ pub(crate) async fn drive_watching<F>(
                         warn!(response_id = %id, "Background response ended without a stored result; marked failed");
                     }
                     Ok(Transition::Missing) => {
-                        warn!(response_id = %id, "Background response ended with no record under its id");
+                        info!(response_id = %id, "Background response ended with no record under its id (deleted while it ran); its result is not stored");
                     }
                     Err(e) => warn!(
                         response_id = %id,
@@ -841,12 +864,23 @@ pub(crate) async fn drive_watching<F>(
     drop(slot);
 }
 
-/// Resolves with the status once the record under `id` reads terminal.
+/// The status the watch answers for a record that is gone: the response was
+/// deleted while its work ran (`DELETE /v1/responses/{id}`, here or on
+/// another gateway sharing the store); the work is dropped like a cancel and
+/// nothing is written under the id again, so the delete holds.
+pub(crate) const DELETED: &str = "deleted";
+
+/// Resolves with the status once the record under `id` reads terminal, or,
+/// once the record was seen (`record_seen` at the start, or by a read of
+/// this watch), with [`DELETED`] once it is gone. A store that never showed
+/// the record is not read as a deletion; a store that cannot be read is
+/// retried at the next tick.
 async fn watch_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     request_context: Option<StorageRequestContext>,
     every: Duration,
+    mut record_seen: bool,
 ) -> String {
     loop {
         tokio::time::sleep(every).await;
@@ -857,10 +891,14 @@ async fn watch_stored_status(
         };
         match stored {
             Ok(Some(stored)) => {
+                record_seen = true;
                 let status = stored.raw_response["status"].as_str().unwrap_or("");
                 if is_terminal(status) {
                     return status.to_string();
                 }
+            }
+            Ok(None) if record_seen => {
+                return DELETED.to_string();
             }
             Ok(None) => {
                 debug!(response_id = %id, "Background response record not found while its work runs");
@@ -1035,7 +1073,7 @@ fn answer_for_closed(raw: Value) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use async_trait::async_trait;
     use smg_data_connector::{MemoryResponseStorage, ResponseStorageError, StoredResponse};
@@ -1167,6 +1205,8 @@ mod tests {
         failures_left: AtomicUsize,
         calls: AtomicUsize,
         stores_landed: AtomicUsize,
+        /// Answers every read with no record, as a store without history does.
+        hides_records: AtomicBool,
     }
 
     impl FlakyStorage {
@@ -1176,7 +1216,12 @@ mod tests {
                 failures_left: AtomicUsize::new(0),
                 calls: AtomicUsize::new(0),
                 stores_landed: AtomicUsize::new(0),
+                hides_records: AtomicBool::new(false),
             }
+        }
+
+        fn hide_records(&self) {
+            self.hides_records.store(true, Ordering::SeqCst);
         }
 
         fn fail_next(&self, failures: usize) {
@@ -1220,6 +1265,9 @@ mod tests {
             response_id: &ResponseId,
         ) -> Result<Option<StoredResponse>, ResponseStorageError> {
             self.unreachable()?;
+            if self.hides_records.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             self.inner.get_response(response_id).await
         }
 
@@ -1517,7 +1565,8 @@ mod tests {
         let raw = stored_raw(&storage, "resp_1").await;
         assert_eq!(raw["status"], "cancelled");
         assert!(raw["error"].is_null(), "{raw}");
-        assert!(!is_closed(&storage, "resp_404", None).await);
+        // A record that is gone reads closed too: nothing is written under it.
+        assert!(is_closed(&storage, "resp_404", None).await);
     }
 
     #[tokio::test]
@@ -1545,6 +1594,159 @@ mod tests {
         assert!(*finished.borrow_and_update());
         assert_eq!(stored_status(&storage, "resp_1").await, "cancelled");
         assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// `DELETE /v1/responses/{id}` while the work runs, here or on another
+    /// gateway: the watch finds the record gone, the work is dropped and
+    /// nothing is written under the id again, so the delete holds.
+    #[tokio::test]
+    async fn a_record_deleted_while_the_work_runs_drops_the_work_and_stays_deleted() {
+        let storage = storage();
+        store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(10),
+        ));
+        wait_for_status(&storage, "resp_1", "in_progress").await;
+        storage
+            .delete_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends once its record is gone")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert_eq!(
+            stored_raw(&storage, "resp_1").await,
+            Value::Null,
+            "nothing is written under the deleted id"
+        );
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// A store that never shows the record (no history backend, or a record
+    /// deleted before the work began) is not read as a deletion: the work
+    /// runs to its end, as before, and stores nothing over the missing
+    /// record.
+    #[tokio::test]
+    async fn a_run_over_a_store_that_never_shows_its_record_reaches_its_end() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&storage, "resp_1").await;
+        flaky.hide_records();
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let work = async move {
+            // Longer than several watch ticks: a watch that read the missing
+            // record as a deletion would drop this before it ends.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let _ = done_tx.send(());
+            Ok(())
+        };
+        drive_watching(storage.clone(), None, slot, work, Duration::from_millis(10)).await;
+        done_rx.await.expect("the work ran to its end");
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// A store blip at the in_progress transition does not disarm the watch:
+    /// the run learns from its first good read that its record exists, and a
+    /// record deleted after that ends the run.
+    #[tokio::test]
+    async fn a_run_that_started_during_a_store_blip_still_ends_when_its_record_is_deleted() {
+        let flaky = Arc::new(FlakyStorage::new());
+        let storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&storage, "resp_1").await;
+        let registry = Arc::new(BackgroundResponses::new(4));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        // The in_progress write fails: the record stays queued and the run
+        // starts without having seen it.
+        flaky.fail_next(1);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(10),
+        ));
+        // A few good reads of the record, then the delete.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(
+            flaky.calls() > 2,
+            "the watch read the record: {} calls",
+            flaky.calls()
+        );
+        storage
+            .delete_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends once its record is gone")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        assert_eq!(
+            stored_raw(&storage, "resp_1").await,
+            Value::Null,
+            "nothing is written under the deleted id"
+        );
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// The guard of the terminal persist: a terminal record reads closed, an
+    /// open one does not, a record that is gone reads closed (the delete
+    /// holds), and a store that cannot be read leaves the record open.
+    #[tokio::test]
+    async fn a_record_that_is_gone_reads_closed_and_an_unreadable_store_does_not() {
+        let storage = storage();
+        store_queued(&storage, "resp_open").await;
+        assert!(!is_closed(&storage, "resp_open", None).await);
+        set_stored_status(&storage, "resp_open", "cancelled", None, None)
+            .await
+            .unwrap();
+        assert!(is_closed(&storage, "resp_open", None).await);
+        assert!(
+            is_closed(&storage, "resp_gone", None).await,
+            "a missing record is closed: nothing is written under it"
+        );
+
+        let flaky = Arc::new(FlakyStorage::new());
+        let flaky_storage: Arc<dyn ResponseStorage> = flaky.clone();
+        store_queued(&flaky_storage, "resp_1").await;
+        flaky.fail_next(1);
+        assert!(
+            !is_closed(&flaky_storage, "resp_1", None).await,
+            "a store that cannot be read leaves the record open"
+        );
+        assert!(!is_closed(&flaky_storage, "resp_1", None).await);
     }
 
     #[tokio::test]
