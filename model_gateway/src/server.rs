@@ -918,7 +918,9 @@ pub struct ServerConfig {
     /// main `port` regardless.
     pub health_check_port: Option<u16>,
     /// Explicit async runtime worker-thread count. `None` uses tokio's
-    /// container-aware default (`available_parallelism()`).
+    /// container-aware default (`available_parallelism()`). Only the CLI's
+    /// `main` sizes its runtime from it; `startup` runs on the caller's
+    /// runtime and logs the size it finds (and this setting, as `pinned`).
     pub runtime_worker_threads: Option<usize>,
     pub router_config: RouterConfig,
     pub max_payload_size: usize,
@@ -1418,6 +1420,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             config.router_config.trace_config.clone(),
         ))
     };
+
+    // The runtime was built by the caller (the CLI's `main`, the Python
+    // binding, a library caller) before the subscriber existed: its size is
+    // logged here, where the line reaches the log. `pinned` is the
+    // configuration's say; only the CLI's `main` sizes its runtime from it.
+    info!(
+        worker_threads = tokio::runtime::Handle::current().metrics().num_workers(),
+        pinned = config.runtime_worker_threads.is_some(),
+        "Tokio runtime sized"
+    );
 
     // Seed the process-wide multimodal tensor transport defaults from the
     // resolved router config; per-worker specs still override at request time.
