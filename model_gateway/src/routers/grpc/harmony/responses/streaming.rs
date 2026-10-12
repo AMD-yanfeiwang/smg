@@ -3,7 +3,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::response::Response;
-use openai_protocol::responses::ResponsesRequest;
+use openai_protocol::responses::{ResponseUsage, ResponsesRequest};
 use serde_json::json;
 use smg_mcp::{McpServerBinding, McpToolSession};
 use tracing::{debug, warn};
@@ -354,19 +354,50 @@ async fn execute_mcp_tool_loop_streaming(
                         total_after = total_calls_after,
                         effective_limit = effective_limit,
                         user_max = ?max_tool_calls,
-                        "Reached tool call limit in streaming - emitting completion with incomplete_details"
+                        "Reached tool call limit in streaming - ending the stream as failed"
                     );
 
-                    // Emit response.completed with incomplete_details and usage
-                    let incomplete_details = json!({ "reason": "max_tool_calls" });
-                    let usage_json = json!({
-                        "input_tokens": usage.prompt_tokens,
-                        "output_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens,
-                        "incomplete_details": incomplete_details,
+                    // The run is aborted, not answered: the stream ends as the
+                    // non-streamed path does, `response.failed` with the error,
+                    // and the usage the non-streamed response carries; and the
+                    // failed object is stored as that path stores its own, read
+                    // before the terminal drains the items, so a background
+                    // response is polled as `failed` with this error rather
+                    // than as a run that ended without a result.
+                    let error = json!({
+                        "code": "max_tool_calls_exceeded",
+                        "message": format!(
+                            "Reached the max_tool_calls limit ({effective_limit}) before executing the remaining tool calls."
+                        ),
                     });
-                    let event = emitter.emit_completed(Some(&usage_json));
-                    emitter.send_event_best_effort(&event, tx).await;
+                    let final_response =
+                        emitter.finalize_failed(Some(usage.clone()), error.clone());
+                    // A foreground record that could not be written is already
+                    // logged and counted by persist; the terminal keeps the
+                    // run's own error, as the regular stream does, and the
+                    // leftover is noted at debug.
+                    if let Err(not_stored) = persist_response_if_needed(
+                        ctx.conversation_storage.clone(),
+                        ctx.conversation_item_storage.clone(),
+                        ctx.response_storage.clone(),
+                        &final_response,
+                        original_request,
+                        ctx.request_context.clone(),
+                    )
+                    .await
+                    {
+                        debug!(
+                            error = ?not_stored.error_object(),
+                            "The tool-call-limit exit keeps its own error over the store failure"
+                        );
+                    }
+                    let usage_json = json!(ResponseUsage::from(&usage));
+                    if let Err(e) = emitter
+                        .emit_terminal(Some(&usage_json), Some(&error), tx)
+                        .await
+                    {
+                        warn!(error = %e, "Failed to end the Harmony Responses stream at the tool-call limit");
+                    }
                     return;
                 }
 
@@ -414,15 +445,41 @@ async fn execute_mcp_tool_loop_streaming(
                         "Function tool calls present - exiting MCP loop and emitting completion"
                     );
 
-                    // Function tool calls were already emitted during streaming processing
-                    // Just emit response.completed with usage
-                    let usage_json = json!({
-                        "input_tokens": usage.prompt_tokens,
-                        "output_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens,
-                    });
-                    let event = emitter.emit_completed(Some(&usage_json));
-                    emitter.send_event_best_effort(&event, tx).await;
+                    // Function tool calls were already emitted during streaming
+                    // processing. The final object is stored as the completed
+                    // exit stores its own (before the terminal drains the items):
+                    // the client runs the calls and continues with this id as
+                    // `previous_response_id`, and a background response is
+                    // polled from this record. Then response.completed with the
+                    // usage the non-streamed response carries.
+                    let final_response = emitter.finalize(Some(usage.clone()));
+                    // As the completed exit: a foreground response the client
+                    // expects stored ends with response.failed when its
+                    // record could not be written.
+                    let not_stored = persist_response_if_needed(
+                        ctx.conversation_storage.clone(),
+                        ctx.conversation_item_storage.clone(),
+                        ctx.response_storage.clone(),
+                        &final_response,
+                        original_request,
+                        ctx.request_context.clone(),
+                    )
+                    .await
+                    .err()
+                    .map(|e| e.error_object());
+                    let usage_json = json!(ResponseUsage::from(&usage));
+                    let event = match &not_stored {
+                        Some(error) => emitter.emit_failed(Some(&usage_json), error),
+                        None => emitter.emit_completed(Some(&usage_json)),
+                    };
+                    // Counted only once the terminal reached the client, as emit_terminal counts.
+                    let delivered = emitter.send_event_best_effort(&event, tx).await;
+                    if delivered && not_stored.is_some() {
+                        Metrics::record_responses_stream_failure(
+                            &original_request.model,
+                            failure_reason(not_stored.as_ref()),
+                        );
+                    }
                     return;
                 }
 
@@ -466,18 +523,10 @@ async fn execute_mcp_tool_loop_streaming(
                 .err()
                 .map(|e| e.error_object());
 
-                // Emit response.completed (or response.failed) with usage
-                let mut usage_json = json!({
-                    "input_tokens": usage.prompt_tokens,
-                    "output_tokens": usage.completion_tokens,
-                    "total_tokens": usage.total_tokens,
-                });
-                if let Some(details) = &usage.prompt_tokens_details {
-                    if details.cached_tokens > 0 {
-                        usage_json["input_tokens_details"] =
-                            json!({ "cached_tokens": details.cached_tokens });
-                    }
-                }
+                // Emit response.completed (or response.failed) with the usage
+                // the non-streamed response (and the stored final response)
+                // carries
+                let usage_json = json!(ResponseUsage::from(&usage));
                 let event = match &not_stored {
                     Some(error) => emitter.emit_failed(Some(&usage_json), error),
                     None => emitter.emit_completed(Some(&usage_json)),
@@ -583,17 +632,10 @@ async fn execute_without_mcp_streaming(
     .err()
     .map(|e| e.error_object());
 
-    // Emit response.completed (or response.failed) with usage
-    let mut usage_json = json!({
-        "input_tokens": usage.prompt_tokens,
-        "output_tokens": usage.completion_tokens,
-        "total_tokens": usage.total_tokens,
-    });
-    if let Some(details) = &usage.prompt_tokens_details {
-        if details.cached_tokens > 0 {
-            usage_json["input_tokens_details"] = json!({ "cached_tokens": details.cached_tokens });
-        }
-    }
+    // Emit response.completed (or response.failed) with the usage
+    // the non-streamed response (and the stored final response)
+    // carries
+    let usage_json = json!(ResponseUsage::from(&usage));
     let event = match &not_stored {
         Some(error) => emitter.emit_failed(Some(&usage_json), error),
         None => emitter.emit_completed(Some(&usage_json)),

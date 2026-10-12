@@ -6,14 +6,14 @@ use futures::Stream;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use openai_protocol::{
     chat::ChatCompletionStreamResponse,
-    common::{Usage, UsageInfo},
+    common::Usage,
     event_types::{
         ContentPartEvent, FunctionCallEvent, McpEvent, OutputItemEvent, OutputTextEvent,
         ResponseEvent,
     },
     responses::{
         IncludeField, IncompleteDetails, IncompleteReason, ResponseOutputItem, ResponseStatus,
-        ResponsesRequest, ResponsesResponse, ResponsesUsage,
+        ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::json;
@@ -867,20 +867,8 @@ impl ResponseStreamEventEmitter {
             })
             .collect();
 
-        // Convert Usage to ResponsesUsage
-        let responses_usage = usage.map(|u| {
-            let usage_info = UsageInfo {
-                prompt_tokens: u.prompt_tokens,
-                completion_tokens: u.completion_tokens,
-                total_tokens: u.total_tokens,
-                reasoning_tokens: u
-                    .completion_tokens_details
-                    .as_ref()
-                    .and_then(|d| d.reasoning_tokens),
-                prompt_tokens_details: u.prompt_tokens_details.clone(),
-            };
-            ResponsesUsage::Modern(usage_info.to_response_usage())
-        });
+        // The usage the terminal event carries, through the one conversion.
+        let responses_usage = usage.map(|u| ResponsesUsage::Modern(ResponseUsage::from(&u)));
 
         // Match the streamed terminal event: a `length` finish reports
         // status=incomplete with the truncation reason.
@@ -909,6 +897,22 @@ impl ResponseStreamEventEmitter {
             builder = builder.error(error);
         }
         builder.build()
+    }
+
+    /// The final object of a run that ends as `failed` before its terminal
+    /// event (the tool-call limit): [`finalize`](Self::finalize)'s object
+    /// with the status and the error the terminal will carry. Read before
+    /// the terminal, which drains the items: the stored object keeps them.
+    pub fn finalize_failed(
+        &self,
+        usage: Option<Usage>,
+        error: serde_json::Value,
+    ) -> ResponsesResponse {
+        let mut response = self.finalize(usage);
+        response.status = ResponseStatus::Failed;
+        response.error = Some(error);
+        response.incomplete_details = None;
+        response
     }
 
     /// Emit reasoning item wrapper events (added + done)
@@ -1536,6 +1540,36 @@ pub(crate) fn attach_mcp_server_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run that ends as failed before its terminal (the tool-call limit)
+    /// stores what the stream carries: `failed`, the error, the items still
+    /// held by the emitter, the usage; the terminal drains them afterwards.
+    #[test]
+    fn the_failed_final_object_keeps_the_items_the_error_and_the_usage() {
+        let mut emitter =
+            ResponseStreamEventEmitter::new("resp_test".into(), "test-model".into(), 0);
+        let (index, id) = emitter.allocate_output_index(OutputItemKind::FunctionCall);
+        let item = json!({"id": id, "type": "function_call", "call_id": "call_test", "name": "lookup", "arguments": "{}", "status": "completed"});
+        emitter.emit_output_item_added(index, &item);
+        emitter.emit_output_item_done(index, &item);
+        emitter.complete_output_item(index);
+        let error = json!({
+            "code": "max_tool_calls_exceeded",
+            "message": "Reached the max_tool_calls limit (1) before executing the remaining tool calls.",
+        });
+
+        let response = emitter.finalize_failed(Some(Usage::from_counts(3, 2)), error.clone());
+
+        assert_eq!(response.status, ResponseStatus::Failed);
+        assert_eq!(response.error, Some(error.clone()));
+        assert!(response.incomplete_details.is_none());
+        let stored = serde_json::to_value(&response).unwrap();
+        assert_eq!(stored["output"][0]["name"], "lookup", "{stored}");
+        assert_eq!(stored["usage"]["total_tokens"], 5, "{stored}");
+        // The terminal built afterwards still carries the item.
+        let terminal = emitter.emit_completed(None);
+        assert_eq!(terminal["response"]["output"][0]["name"], "lookup");
+    }
 
     #[tokio::test]
     async fn the_error_event_is_remembered_for_the_stream_runner() {
