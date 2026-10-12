@@ -692,11 +692,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// successful contact, instead of at its next scheduled probe.
     fn signal_connected(&self) {}
 
-    /// Close the circuit breaker: the worker has returned (a liveness veto
-    /// cleared by a contact, or health promoted it back to Ready) and the
-    /// failures that opened it belong to the outage. It reopens on fresh
-    /// failures like any closed breaker.
+    /// Close the circuit breaker: a liveness veto was cleared by a contact,
+    /// so the failures that opened it belong to the outage. It reopens on
+    /// fresh failures like any closed breaker. A health promotion goes
+    /// through [`Self::readmit_circuit_breaker`] instead: an open breaker is
+    /// put on trial, not closed.
     fn reset_circuit_breaker(&self) {}
+
+    /// The worker's health returned: put its open circuit breaker on trial
+    /// (half-open) now, as its timeout would, or forget the failure streak a
+    /// still-closed breaker banked during the outage. Returns whether an
+    /// open breaker went on trial; a worker without a breaker never does.
+    fn readmit_circuit_breaker(&self) -> bool {
+        false
+    }
 
     /// Record that the worker just became routable (promotion to Ready, or a
     /// liveness veto cleared); the warm-up slice counts from here.
@@ -2683,6 +2692,15 @@ impl Worker for BasicWorker {
 
     fn reset_circuit_breaker(&self) {
         self.circuit_breaker.load().reset();
+    }
+
+    fn readmit_circuit_breaker(&self) -> bool {
+        let breaker = self.circuit_breaker.load();
+        if breaker.try_half_open() {
+            return true;
+        }
+        breaker.clear_failure_streak();
+        false
     }
 
     fn note_admitted(&self) {
