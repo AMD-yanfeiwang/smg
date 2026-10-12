@@ -324,9 +324,10 @@ pub(super) async fn load_conversation_history(
             .get_conversation(&conv_id)
             .await
             .map_err(|e| {
-                error::internal_error(
+                error::storage_failure(
                     "check_conversation_failed",
-                    format!("Failed to check conversation: {e}"),
+                    "Failed to check conversation",
+                    &e,
                 )
             })?;
 
@@ -398,7 +399,15 @@ pub(super) async fn load_conversation_history(
                 modified_request.input = ResponseInput::Items(items);
             }
             Err(e) => {
-                warn!("Failed to load conversation history: {}", e);
+                // A listing the store did not answer (or refused) is not an
+                // answer without the conversation's context: the client reads
+                // a 503 for a timed-out store and a 500 for any other failure,
+                // as every other store-dependent answer of this path does.
+                return Err(error::storage_failure(
+                    "load_conversation_history_failed",
+                    "Failed to load conversation history",
+                    &e,
+                ));
             }
         }
     }
@@ -480,9 +489,10 @@ pub(super) async fn resolve_item_references(
             .find_response_by_output_item(id)
             .await
             .map_err(|e| {
-                error::internal_error(
+                error::storage_failure(
                     "resolve_item_reference_failed",
-                    format!("Failed to resolve item '{id}': {e}"),
+                    format!("Failed to resolve item '{id}'"),
+                    &e,
                 )
             })?
             // The items of a response its client asked not to store are not

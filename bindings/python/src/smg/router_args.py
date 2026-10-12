@@ -362,6 +362,10 @@ class RouterArgs:
     # Seconds of upstream silence after which an open SSE stream carries a
     # keep-alive frame; 0 sends none; appended last for the same reason
     sse_keepalive_secs: int = 15
+    # The bound on one history-store call (pool wait, connect and the
+    # operation included); appended last for positional callers
+    postgres_op_timeout_secs: int = 5
+    redis_op_timeout_secs: int = 5
 
     @staticmethod
     def add_cli_args(
@@ -2030,6 +2034,13 @@ class RouterArgs:
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
         )
+        postgres_group.add_argument(
+            f"--{prefix}postgres-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("POSTGRES_OP_TIMEOUT_SECS", RouterArgs.postgres_op_timeout_secs)),
+            help="Bound in seconds on each call to the PostgreSQL store (pool wait, connect and the statement); "
+            "a call past it is answered 503 storage_unavailable (default: 5, env: POSTGRES_OP_TIMEOUT_SECS)",
+        )
 
         # Redis configuration
         redis_group.add_argument(
@@ -2049,6 +2060,14 @@ class RouterArgs:
             type=int,
             default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
             help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("REDIS_OP_TIMEOUT_SECS", RouterArgs.redis_op_timeout_secs)),
+            help="Bound in seconds on each call to the Redis store (pool wait, connect and the command; replaces the "
+            "client library's 500 ms / 1 s defaults); a call past it is answered 503 storage_unavailable "
+            "(default: 5, env: REDIS_OP_TIMEOUT_SECS)",
         )
 
         # Schema configuration
