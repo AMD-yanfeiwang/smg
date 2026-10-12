@@ -304,7 +304,12 @@ struct CliArgs {
 
     /// Spill gate, absolute part: a matched worker is skipped for the
     /// least-loaded one when its load exceeds the healthy-fleet mean by this
-    /// many requests AND by --balance-rel-threshold
+    /// many requests AND by --balance-rel-threshold. The margin is capped at
+    /// the in-flight count's natural swing at the pool's current mean (two
+    /// standard deviations, never under four requests unless this value is
+    /// lower), so a small pool can spill at all. With the bucket policy the
+    /// pair keeps its own rule: balancing when (max_load - min_load) exceeds
+    /// this value and max_load exceeds min_load times --balance-rel-threshold
     #[arg(
         long,
         visible_alias = "spill-abs-threshold",

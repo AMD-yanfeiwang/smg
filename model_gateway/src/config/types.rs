@@ -1000,7 +1000,11 @@ pub enum PolicyConfig {
         cache_threshold: f32,
         /// Spill gate, absolute part: the selected worker spills to
         /// least-loaded when its load exceeds the healthy-fleet mean by this
-        /// many requests AND by `balance_rel_threshold`.
+        /// many requests AND by `balance_rel_threshold`; capped at the
+        /// in-flight count's natural swing at the pool's current mean (two
+        /// standard deviations, never under four requests unless this value
+        /// is lower), so a small pool
+        /// can spill at all.
         #[serde(alias = "spill_abs_threshold")]
         balance_abs_threshold: usize,
         /// Spill gate, relative part (multiple of the healthy-fleet mean);
