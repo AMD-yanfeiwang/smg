@@ -1872,6 +1872,17 @@ impl WorkerRuntime {
 
     pub fn note_token_progress(&self) {
         let now = super::liveness::now_ms();
+        // The stamps are millisecond stamps and the wake keeps one permit, so
+        // a token within the millisecond of the previous one has nothing to
+        // record: it leaves with one plain load. Every stream of the worker
+        // reports here for every token, from whichever core runs it; the
+        // three stores and the notifier's compare-exchange would otherwise
+        // bounce the worker's cache lines between cores once per token.
+        if self.last_token_ms.load(Ordering::Relaxed) == now
+            && !self.transport_failed.load(Ordering::Relaxed)
+        {
+            return;
+        }
         self.last_token_ms.store(now, Ordering::Relaxed);
         self.last_contact_ms.store(now, Ordering::Relaxed);
         self.transport_failed.store(false, Ordering::Relaxed);
@@ -3324,6 +3335,7 @@ mod tests {
     use super::*;
     use crate::worker::{
         circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        liveness::now_ms,
         BasicWorkerBuilder,
     };
 
@@ -4899,6 +4911,72 @@ mod tests {
         worker.set_completion_sink(None);
         drop(WorkerLoadGuard::with_key(Arc::clone(&worker), None));
         assert_eq!(spy.0.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_token_within_the_stamped_millisecond_records_nothing_new_and_keeps_the_semantics() {
+        let runtime = WorkerRuntime::new("http://w1:8000", WorkerStatus::Ready);
+        let wake = runtime.contact_wake();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // Whether the notifier holds a permit: `notify_one` leaves one for a
+        // later waiter, so a waiter that returns within the bound found it.
+        let permit = |bound_ms: u64| {
+            rt.block_on(async {
+                time::timeout(Duration::from_millis(bound_ms), wake.notified())
+                    .await
+                    .is_ok()
+            })
+        };
+
+        // Two tokens inside one millisecond: the first stamps and leaves the
+        // permit, the second has nothing new to record and leaves none.
+        // Retried until both calls land in the same millisecond.
+        let mut aligned = false;
+        for _ in 0..1_000 {
+            // A fresh millisecond: the runtime's own construction stamp (or the
+            // previous attempt's) must not be the one the first token repeats.
+            thread::sleep(Duration::from_millis(2));
+            let ms = now_ms();
+            runtime.note_token_progress();
+            assert!(permit(50), "the first token leaves the notifier's permit");
+            runtime.note_token_progress();
+            if now_ms() == ms {
+                aligned = true;
+                break;
+            }
+            // The millisecond turned between the two: the second one stamped
+            // and left a permit; drain it and try again.
+            let _ = permit(50);
+        }
+        assert!(aligned, "two tokens never landed in one millisecond");
+        assert!(
+            !permit(10),
+            "a token within the stamped millisecond leaves no new permit"
+        );
+
+        // A transport failure flagged between two tokens of one millisecond is
+        // cleared by the next token all the same, and that token stamps.
+        runtime.note_transport_failure();
+        assert!(runtime.transport_failure_pending());
+        runtime.note_token_progress();
+        assert!(
+            !runtime.transport_failure_pending(),
+            "progress clears a transport failure, same millisecond or not"
+        );
+        assert!(permit(50), "the clearing token wakes the notifier");
+
+        // Once the millisecond turns, the next token stamps again.
+        let stamped = runtime.progress_reference_ms();
+        thread::sleep(Duration::from_millis(3));
+        runtime.note_token_progress();
+        assert!(runtime.progress_reference_ms() > stamped);
+        assert!(
+            permit(50),
+            "a token in a new millisecond wakes the notifier"
+        );
     }
 
     #[test]
