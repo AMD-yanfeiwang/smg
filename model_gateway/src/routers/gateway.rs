@@ -296,7 +296,8 @@ impl Gateway {
         self.pick_router_by_weights(grpc_epd, grpc_pd, http_pd, grpc_regular, http_regular)
             .or_else(|| {
                 self.incomplete_disaggregated_router(
-                    grpc_encode + grpc_prefill + grpc_decode,
+                    grpc_encode,
+                    grpc_prefill + grpc_decode,
                     http_prefill + http_decode,
                 )
             })
@@ -312,22 +313,33 @@ impl Gateway {
     /// the family's labels. Falling to the default router instead answered
     /// that the model does not exist (404 `model_not_found`) and counted the
     /// refusal under that router's labels, for a model that is served and
-    /// merely has no complete pair at the moment. `None` when no leg of the
-    /// model is registered on either wire: the default router's answer
-    /// stands for a model nobody serves.
+    /// merely has no complete pair at the moment. An encode leg is the EPD
+    /// family's alone: registered beside a missing prefill or decode leg it
+    /// makes that family the first choice, and registered alone it takes the
+    /// EPD router when one is mounted (whose selection answers the incomplete
+    /// set itself) and the default router otherwise, never the PD router,
+    /// whose refusal would count and log it as prefill/decode traffic.
+    /// `None` when no leg of the model is registered on either wire, or no
+    /// family's router is mounted: the default router's answer stands.
     fn incomplete_disaggregated_router(
         &self,
-        grpc_legs: usize,
-        http_legs: usize,
+        grpc_encode: usize,
+        grpc_pair_legs: usize,
+        http_pair_legs: usize,
     ) -> Option<Arc<dyn RouterTrait>> {
         let routers = self.routers.load();
         let family = |ids: &[&RouterId]| ids.iter().find_map(|id| routers.get(*id).cloned());
-        if grpc_legs > 0 {
-            if let Some(router) = family(&[&router_ids::GRPC_PD, &router_ids::GRPC_EPD]) {
+        if grpc_pair_legs > 0 || grpc_encode > 0 {
+            let ids: &[&RouterId] = match (grpc_encode > 0, grpc_pair_legs > 0) {
+                (true, true) => &[&router_ids::GRPC_EPD, &router_ids::GRPC_PD],
+                (true, false) => &[&router_ids::GRPC_EPD],
+                _ => &[&router_ids::GRPC_PD, &router_ids::GRPC_EPD],
+            };
+            if let Some(router) = family(ids) {
                 return Some(router);
             }
         }
-        if http_legs > 0 {
+        if http_pair_legs > 0 {
             return family(&[&router_ids::HTTP_PD]);
         }
         None
@@ -1698,6 +1710,46 @@ mod tests {
                 &[(&router_ids::GRPC_EPD, "grpc_epd")]
             ),
             "grpc_epd"
+        );
+        // An encode leg alone is the EPD family's: with no EPD router mounted
+        // the default router answers (as for a model nobody serves, its
+        // refusal counted and logged as regular traffic), never the PD
+        // router; with one mounted (every router is, under IGW) the EPD
+        // router, whose selection answers the incomplete set itself.
+        assert_eq!(
+            picked(&[(WorkerType::Encode, ConnectionMode::Grpc)], &both_pd),
+            "stub"
+        );
+        let with_epd = [
+            (&router_ids::GRPC_PD, "grpc_pd"),
+            (&router_ids::HTTP_PD, "http_pd"),
+            (&router_ids::GRPC_EPD, "grpc_epd"),
+        ];
+        assert_eq!(
+            picked(&[(WorkerType::Encode, ConnectionMode::Grpc)], &with_epd),
+            "grpc_epd"
+        );
+        // An encode leg beside a decode leg (the prefill missing): the EPD
+        // family first when it is mounted, the PD family otherwise.
+        assert_eq!(
+            picked(
+                &[
+                    (WorkerType::Encode, ConnectionMode::Grpc),
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                ],
+                &with_epd
+            ),
+            "grpc_epd"
+        );
+        assert_eq!(
+            picked(
+                &[
+                    (WorkerType::Encode, ConnectionMode::Grpc),
+                    (WorkerType::Decode, ConnectionMode::Grpc),
+                ],
+                &both_pd
+            ),
+            "grpc_pd"
         );
         // No leg of the model at all: the default router answers for a model
         // nobody serves.
