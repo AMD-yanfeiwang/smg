@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_DRAIN_SECS = 5.0
 ENGINE_TERMINATE_SECS = 30.0
+# How long the Rust server gets to stop: at the end of the supervision loop,
+# and when the engine launch behind an already-bound server failed.
+SERVER_STOP_SECS = 5.0
 # Bound on silence during the engine's ZMQ handshake. An engine's start
 # includes model load, kernel JIT and graph capture, and nothing crosses the
 # wire between its first handshake message and its last; a server that takes
@@ -704,6 +707,46 @@ def _start_time(pid: int) -> str | None:
     return fields[19]
 
 
+def mark_not_serving(server: Any) -> None:
+    """Health flips to NOT_SERVING (the Router stops routing here); a failure
+    to flip it is logged, never raised: the caller's own outcome is the one
+    that propagates."""
+    try:
+        server.set_serving(False)
+    except Exception:
+        logger.exception("Failed to mark the servicer as not serving")
+
+
+async def stop_server(server: Any, timeout: float) -> None:
+    """Stop the Rust server off the event loop, within ``timeout``; a failure
+    to stop is logged, never raised, for the same reason."""
+    try:
+        await asyncio.to_thread(server.stop, timeout)
+    except Exception:
+        logger.exception("Failed to stop the Rust servicer cleanly")
+
+
+async def launch_or_stop(server: Any, launch: Callable[[], Any]) -> Any:
+    """Start the engine behind an already-bound server: ``launch()``'s handle,
+    or, when the launch raises, that error after the server was marked not
+    serving and stopped, each step best effort. The server owns the port and
+    a runtime thread; a launch that fails must not leave them to the process
+    exit, and the launch error is what the entry point reports. A
+    cancellation of this task while the stop runs waits for the stop too:
+    the port is released either way."""
+    try:
+        return launch()
+    except BaseException:
+        mark_not_serving(server)
+        stopping = asyncio.create_task(stop_server(server, SERVER_STOP_SECS))
+        try:
+            await asyncio.shield(stopping)
+        except asyncio.CancelledError:
+            await asyncio.shield(stopping)
+            raise
+        raise
+
+
 def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> None:
     """SIGTERM the headless engine (it tears down its own workers), then kill;
     workers that outlived it either way are killed too."""
@@ -727,7 +770,7 @@ async def supervise(
     engine: Any,
     *,
     drain_secs: float = DEFAULT_DRAIN_SECS,
-    stop_timeout: float = 5.0,
+    stop_timeout: float = SERVER_STOP_SECS,
     stop_event: asyncio.Event | None = None,
     poll_secs: float = _POLL_SECS,
 ) -> int:
@@ -773,16 +816,10 @@ async def supervise(
             except asyncio.TimeoutError:  # noqa: UP041 -- distinct from the builtin before 3.11
                 pass
     finally:
-        try:
-            server.set_serving(False)
-        except Exception:
-            logger.exception("Failed to mark the servicer as draining")
+        mark_not_serving(server)
         if stop_event.is_set() and drain_secs > 0 and engine.poll() is None:
             logger.info("Draining for %.1fs before stopping", drain_secs)
             await asyncio.sleep(drain_secs)
-        try:
-            await asyncio.to_thread(server.stop, stop_timeout)
-        except Exception:
-            logger.exception("Failed to stop the Rust servicer cleanly")
+        await stop_server(server, stop_timeout)
         terminate_engine(engine)
     return exit_code
