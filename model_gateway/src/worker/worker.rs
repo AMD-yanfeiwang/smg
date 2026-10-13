@@ -3999,6 +3999,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The load counter's increment, a million times: the count is exact,
+    /// and the rate is printed. The rate is machine-bound (a loaded or slow
+    /// machine reaches a fraction of a quiet one's), so the unit suite
+    /// asserts no absolute floor; `SMG_TEST_LOAD_COUNTER_FLOOR=<ops/s>` turns
+    /// the printed measurement into an assertion for a run on a known machine.
     #[test]
     #[expect(clippy::print_stderr)]
     fn test_load_counter_performance() {
@@ -4016,16 +4021,28 @@ mod tests {
             worker.increment_load();
         }
         let duration = start.elapsed();
+        assert_eq!(worker.load(), iterations);
 
         let ops_per_sec = iterations as f64 / duration.as_secs_f64();
         eprintln!("Load counter operations per second: {ops_per_sec:.0}");
 
-        // Lower bound is intentionally generous so this microbench does
-        // not flake on CI runners under contention. A relaxed Acquire/
-        // Release atomic increment should comfortably exceed this on any
-        // reasonable hardware — observed CI floor is around 1M ops/sec,
-        // so 500k gives a 2x safety margin.
-        assert!(ops_per_sec > 500_000.0);
+        // An asked-for floor is an assertion; an unreadable or malformed one
+        // is an error, not a silently skipped check: only an absent variable
+        // means no floor was asked for.
+        match std::env::var("SMG_TEST_LOAD_COUNTER_FLOOR") {
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("SMG_TEST_LOAD_COUNTER_FLOOR is unreadable: {error}"),
+            Ok(floor) => {
+                let floor: f64 = match floor.parse::<f64>() {
+                    Ok(floor) if floor.is_finite() => floor,
+                    _ => panic!("SMG_TEST_LOAD_COUNTER_FLOOR {floor:?} is not a finite number"),
+                };
+                assert!(
+                    ops_per_sec > floor,
+                    "load counter: {ops_per_sec:.0} ops/s, under the asked-for floor of {floor:.0}"
+                );
+            }
+        }
     }
 
     #[test]
