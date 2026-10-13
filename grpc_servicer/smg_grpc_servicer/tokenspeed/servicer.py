@@ -46,6 +46,7 @@ from tokenspeed.runtime.pd.kv_events import KVEventBatch
 from smg_grpc_servicer.kv_events import endpoint_for_rank, stream_kv_events
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import (
@@ -198,6 +199,21 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
     # ------------------------------------------------------------------
     # Generate (server-streaming)
     # ------------------------------------------------------------------
+
+    @functools.cached_property
+    def _config(self) -> EngineConfigView:
+        """The launcher's server args and the engine's model config, read once:
+        the load record reads them on every KV-event batch. One field of the
+        args does change for the servicer's life, ``weight_version`` (an RL
+        weight update writes the new version back onto the args), so
+        ``GetModelInfo`` reads it live through a fresh view, not from here."""
+        return EngineConfigView(self.server_args, getattr(self.async_llm, "model_config", None))
+
+    @functools.cached_property
+    def _engine_config(self) -> EngineConfigView:
+        """The engine's own copy of the server args (the knobs it resolved:
+        the page size, the token budget), read once."""
+        return EngineConfigView(self.async_llm.server_args)
 
     async def Generate(
         self,
@@ -364,7 +380,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # bootstrap-less probe. So skip the deep probe and report shallow liveness
         # for any disaggregated role; the deep generate probe is meaningful only
         # for aggregated (null) workers.
-        if getattr(self.server_args, "disaggregation_mode", "null") != "null":
+        if self._config.server_args.disaggregation_mode != "null":
             return tokenspeed_scheduler_pb2.HealthCheckResponse(
                 healthy=True,
                 message="Health check passed (disaggregation worker; shallow probe)",
@@ -469,48 +485,31 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         _context: grpc.aio.ServicerContext,
     ) -> tokenspeed_scheduler_pb2.GetModelInfoResponse:
         model_config = self.async_llm.model_config
-        hf_config = getattr(model_config, "hf_config", None)
-
-        eos = getattr(hf_config, "eos_token_id", None) if hf_config else None
-        if isinstance(eos, int):
-            eos_token_ids = [eos]
-        elif isinstance(eos, list):
-            eos_token_ids = list(eos)
-        else:
-            eos_token_ids = []
+        args, model = self._config.server_args, self._config.model
 
         max_req_input_len = self.scheduler_info.get("max_req_input_len") or (
             self.async_llm.max_req_input_len or 0
         )
-
-        # Upstream renamed ``model_path`` → ``model`` and
-        # ``tokenizer_path`` → ``tokenizer``; accept either so the servicer
-        # works against both old and new builds.
-        model_path = getattr(self.server_args, "model", None) or getattr(
-            self.server_args, "model_path", ""
-        )
-        tokenizer_path = getattr(self.server_args, "tokenizer", None) or getattr(
-            self.server_args, "tokenizer_path", ""
-        )
-        supported_modalities = self._static_supported_modalities(model_config, hf_config)
+        supported_modalities = self._static_supported_modalities(model_config, model.hf_config)
         supports_vision = any(
             modality in (common_pb2.IMAGE, common_pb2.VIDEO) for modality in supported_modalities
         )
         supports_multimodal = bool(supported_modalities)
 
         response_kwargs = dict(
-            model_path=model_path,
-            tokenizer_path=tokenizer_path or "",
-            default_sampling_params_json=self.server_args.preferred_sampling_params or "",
-            weight_version=str(getattr(self.server_args, "weight_version", "") or ""),
-            served_model_name=(self.server_args.served_model_name or model_path),
+            model_path=args.model,
+            tokenizer_path=args.tokenizer,
+            default_sampling_params_json=args.preferred_sampling_params or "",
+            # Live, not from the cached view: an RL weight update rewrites it.
+            weight_version=EngineConfigView(self.server_args).server_args.weight_version,
+            served_model_name=(args.served_model_name or args.model),
             max_context_length=int(self.async_llm.context_len),
-            vocab_size=int(model_config.vocab_size),
-            model_type=(getattr(hf_config, "model_type", "") or "") if hf_config else "",
-            architectures=(getattr(hf_config, "architectures", []) or []) if hf_config else [],
-            eos_token_ids=eos_token_ids,
-            pad_token_id=(getattr(hf_config, "pad_token_id", 0) or 0) if hf_config else 0,
-            bos_token_id=(getattr(hf_config, "bos_token_id", 0) or 0) if hf_config else 0,
+            vocab_size=model.vocab_size,
+            model_type=model.model_type,
+            architectures=model.architectures,
+            eos_token_ids=model.eos_token_ids,
+            pad_token_id=model.pad_token_id,
+            bos_token_id=model.bos_token_id,
             max_req_input_len=int(max_req_input_len),
             supports_vision=supports_vision,
         )
@@ -519,7 +518,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             response_kwargs["supports_multimodal"] = supports_multimodal
         if "supported_modalities" in fields:
             response_kwargs["supported_modalities"] = supported_modalities
-        dtype = self._torch_dtype_to_proto(getattr(model_config, "dtype", None))
+        dtype = self._torch_dtype_to_proto(model.dtype)
         if "model_dtype" in fields:
             response_kwargs["model_dtype"] = dtype
         if "multimodal_encoder_dtype" in fields:
@@ -601,16 +600,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # gateway's label extraction reads) only when the engine can honor a
         # rank pin — the label doubles as the capability handshake.
         if _engine_supports_dp_rank_pin():
-            dp_size = getattr(
-                getattr(getattr(self.server_args, "mapping", None), "attn", None),
-                "dp_size",
-                None,
-            )
+            dp_size = self._config.server_args.attention_dp_size
             # > 1 only: a width-1 pin has no placement to choose, yet an
             # explicit pin still changes engine-side scheduling. Dp-aware
             # gateways degrade a missing label to a plain worker, so
             # single-rank engines simply stay label-free.
-            if isinstance(dp_size, int) and dp_size > 1:
+            if dp_size is not None and dp_size > 1:
                 server_args_dict["dp_size"] = dp_size
 
         # The operator's PD pairing protocol rides with the server args, so
@@ -696,7 +691,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         is well under the gateway's 10 s metadata step, so a silent scheduler
         costs this one field, not the worker's registration.
         """
-        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+        if self._config.server_args.disaggregation_mode == "encode":
             return False
         query = getattr(self.async_llm, "is_scheduler_paused", None)
         if not callable(query):
@@ -736,7 +731,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # response so a frontend polling loads on an encode worker reads "no
         # scheduler load" instead of crashing the engine. Prefill/decode loops
         # dispatch GetLoadReqInput correctly and keep reporting real loads.
-        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+        if self._config.server_args.disaggregation_mode == "encode":
             return tokenspeed_scheduler_pb2.GetLoadsResponse(
                 timestamp=datetime.now(timezone.utc).isoformat(),
                 version="tokenspeed",
@@ -784,7 +779,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         # Only legacy token pages have a page size. Native snapshots count
         # LCM allocator blocks, whose packing is independent of launch grain.
-        page_size = int(getattr(self.async_llm.server_args, "page_size", 0) or 0)
+        page_size = self._engine_config.server_args.page_size
         if load_outputs and snapshots is None and page_size <= 0:
             await context.abort(grpc.StatusCode.UNAVAILABLE, "KV page geometry is unavailable")
             return
@@ -834,8 +829,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         # Fall back to ``server_args.max_total_num_tokens`` for SimpleNamespace test stubs.
         return int(
             (self.scheduler_info.get("max_total_num_tokens") if self.scheduler_info else None)
-            or getattr(self.async_llm.server_args, "max_total_num_tokens", 0)
-            or 0
+            or self._engine_config.server_args.max_total_num_tokens
         )
 
     def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
@@ -845,7 +839,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         encode worker has no scheduler load, and an older engine without the
         replica would need a scheduler round trip per record: both push none
         and stay polled."""
-        if getattr(self.server_args, "disaggregation_mode", "null") == "encode":
+        if self._config.server_args.disaggregation_mode == "encode":
             return None
         store = getattr(self.async_llm, "load_snapshot_store", None)
         if store is None:
@@ -1036,9 +1030,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         # Upstream renamed ``tokenizer_path`` → ``tokenizer``; accept either so
         # the servicer works against both old and new builds (see GetModelInfo).
-        tokenizer_path = getattr(self.server_args, "tokenizer", None) or getattr(
-            self.server_args, "tokenizer_path", ""
-        )
+        tokenizer_path = self._config.server_args.tokenizer
         if not tokenizer_path:
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
@@ -1136,7 +1128,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
         sampling = self._sampling_params_from_proto(
             request.sampling_params,
-            reasoning_parser=getattr(self.server_args, "reasoning_parser", None),
+            reasoning_parser=self._config.server_args.reasoning_parser,
         )
 
         # Decode the precomputed multimodal payload, if the request carries one.
@@ -1147,7 +1139,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         if request.HasField("mm_inputs"):
             precomputed_mm = self._mm_inputs_from_proto(
                 request.mm_inputs,
-                model_dtype=getattr(self.async_llm.model_config, "dtype", None),
+                model_dtype=self._config.model_dtype,
             )
 
         # EPD: per-item encode->prefill bootstrap info. Each entry tells the prefill
