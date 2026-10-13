@@ -156,6 +156,13 @@ pub(crate) async fn prepare_chat_like(
                 &tokenizer_id,
                 &tokenizer_source,
                 &engine_limits,
+                |format| {
+                    multimodal::fleet_reads_format(
+                        &ctx.components.worker_registry,
+                        model_id,
+                        format,
+                    )
+                },
             )
             .await
             .map_err(|e| {

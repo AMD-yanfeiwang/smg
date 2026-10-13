@@ -19,7 +19,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{
-    AudioClip, EncoderFieldLayouts, ImageFrame, Modality, PlaceholderRange,
+    AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame, Modality, PlaceholderRange,
     PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
@@ -68,8 +68,8 @@ pub(crate) use assemble::{
     assemble_tokenspeed_for_encode, encode_routing_hashes,
 };
 pub(crate) use capability::{
-    ensure_backend_supports_modalities, ensure_model_accepts_media, request_needs_vision,
-    worker_language_model_only, SUPPORTS_VISION_LABEL,
+    ensure_backend_supports_modalities, ensure_model_accepts_media, fleet_reads_format,
+    request_needs_vision, worker_language_model_only, SUPPORTS_VISION_LABEL,
 };
 pub(crate) use config::{
     load_image_preprocessor_config, load_video_preprocessor_config, MultimodalComponents,
@@ -81,8 +81,8 @@ pub(crate) use inflight::{
 };
 pub(crate) use item_limits::engine_item_limits;
 pub(crate) use plan::{
-    prepare_placeholder_tokens, resolve_media_part_order, validate_rendered_media_anchors,
-    MediaPlan, PlaceholderTokens,
+    anchor_rendered_markers, prepare_placeholder_tokens, resolve_media_part_order,
+    validate_rendered_media_anchors, MediaPlan, PlaceholderTokens,
 };
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
@@ -140,6 +140,9 @@ pub(crate) struct MultimodalIntermediate {
     /// Independently preprocessed modality batches sharing one expanded prompt.
     /// A single-modality request is represented by a one-element vector.
     batches: Vec<PrecomputedMultimodalIntermediate>,
+    /// The format the spec's processors emitted the batches in
+    /// (`ModelProcessorSpec::encoder_input_format`).
+    encoder_input_format: EncoderInputFormat,
 }
 
 impl MultimodalIntermediate {
@@ -160,7 +163,19 @@ impl MultimodalIntermediate {
                 "multimodal intermediate contains an empty {modality} batch"
             );
         }
-        Ok(Self { batches })
+        Ok(Self {
+            batches,
+            encoder_input_format: EncoderInputFormat::Reference,
+        })
+    }
+
+    pub(crate) fn with_encoder_input_format(mut self, format: EncoderInputFormat) -> Self {
+        self.encoder_input_format = format;
+        self
+    }
+
+    pub(crate) fn encoder_input_format(&self) -> EncoderInputFormat {
+        self.encoder_input_format
     }
 
     pub(crate) fn batches(&self) -> &[PrecomputedMultimodalIntermediate] {
