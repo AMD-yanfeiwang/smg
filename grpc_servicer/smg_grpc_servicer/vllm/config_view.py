@@ -4,19 +4,20 @@ vLLM offers no API for the facts the servicers advertise beyond its config
 attributes, and those move between releases: a section an older version does
 not carry, an attribute a newer one adds, a name that changes. One reader
 here knows the names and what stands in when they are absent;
-:mod:`.model_info`, :mod:`.kv_transfer`, :mod:`.kv_events` and the Python
-servicer read typed sections off it, so a vLLM rename is one fix, found by
-this module's tests and the Python servicer's live lane. Engine-free at
-import: the config objects are taken as given and nothing from vLLM is
-imported.
+:mod:`.model_info`, :mod:`.kv_transfer`, :mod:`.kv_events`, the Python
+servicer and the Rust launcher (:mod:`.rust`) read typed sections off it, so
+a vLLM rename is one fix, found by this module's tests and the Python
+servicer's live lane. Engine-free at import: the config objects are taken as
+given and nothing from vLLM is imported.
 
 A section is read when first asked for, once per view; a reader builds a
 view where it reads (a view holds a reference and nothing else until a
 section is asked for). The sections are lenient (a missing section reads as
-its defaults, a view over ``None`` reads every section so) except the two
-facts the servicers never invent: :attr:`model`, the facts of
-``GetModelInfo``, fails on a config without the model's name, context length
-or vocabulary, and :attr:`data_parallel_size` on a config without one.
+its defaults, a view over ``None`` reads every section so) except what the
+servicers never invent: :attr:`model`, the facts of ``GetModelInfo``, fails
+on a config without the model's name, context length or vocabulary;
+:attr:`data_parallel_size` on a config without one; and :attr:`launch`, the
+process manager's inputs, on a config missing any one of them.
 """
 
 from __future__ import annotations
@@ -73,6 +74,8 @@ class ModelSection:
     hf_eos_token_ids: list[int]
     pad_token_id: int
     bos_token_id: int
+    # The revision the tokenizer is fetched at: the tokenizer's own, else the model's.
+    tokenizer_revision: str | None
 
     @classmethod
     def read(cls, model_config: Any) -> ModelSection:
@@ -92,6 +95,8 @@ class ModelSection:
             hf_eos_token_ids=hf_eos_token_ids(model_config),
             pad_token_id=int(getattr(hf_config, "pad_token_id", None) or 0),
             bos_token_id=int(getattr(hf_config, "bos_token_id", None) or 0),
+            tokenizer_revision=getattr(model_config, "tokenizer_revision", None)
+            or getattr(model_config, "revision", None),
         )
 
 
@@ -122,11 +127,15 @@ class MultimodalSection:
 @dataclasses.dataclass(frozen=True)
 class ParallelSection:
     """``ParallelConfig`` as a lenient read: the data-parallel width when the
-    config carries a count (``None`` otherwise), and the first rank this
-    process serves (0 unless the config says otherwise)."""
+    config carries a count (``None`` otherwise), the first rank this process
+    serves (0 unless the config says otherwise), this node's rank within the
+    data-parallel group (0: the head node) and the data-parallel backend
+    (``mp`` unless the config says otherwise)."""
 
     data_parallel_size: int | None
     data_parallel_rank: int
+    node_rank_within_dp: int
+    data_parallel_backend: str
 
     @classmethod
     def read(cls, vllm_config: Any) -> ParallelSection:
@@ -134,6 +143,32 @@ class ParallelSection:
         return cls(
             data_parallel_size=_positive_int(getattr(parallel, "data_parallel_size", None)),
             data_parallel_rank=_positive_int(getattr(parallel, "data_parallel_rank", 0)) or 0,
+            node_rank_within_dp=getattr(parallel, "node_rank_within_dp", 0),
+            data_parallel_backend=getattr(parallel, "data_parallel_backend", "mp"),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchSection:
+    """What vLLM's own process manager is started with on the head node, as
+    ``run_headless`` reads it: every field required of the config (an engine
+    this launcher cannot start this way fails here, by name)."""
+
+    local_engine_count: int
+    start_index: int
+    master_ip: str
+    rpc_port: int
+    shutdown_timeout: Any
+
+    @classmethod
+    def read(cls, vllm_config: Any) -> LaunchSection:
+        parallel = vllm_config.parallel_config
+        return cls(
+            local_engine_count=parallel.data_parallel_size_local,
+            start_index=parallel.data_parallel_rank,
+            master_ip=parallel.data_parallel_master_ip,
+            rpc_port=parallel.data_parallel_rpc_port,
+            shutdown_timeout=vllm_config.shutdown_timeout,
         )
 
 
@@ -163,10 +198,12 @@ _UNKNOWN = object()
 
 @dataclasses.dataclass(frozen=True)
 class StructuredOutputsSection:
-    """``StructuredOutputsConfig``: the reasoning parser ("" for none, with
+    """``StructuredOutputsConfig``: the backend (``None`` when the section or
+    the attribute is not there), the reasoning parser ("" for none, with
     ``reasoning_parser_known`` false when the section, or its parser attribute,
     is not there at all), and whether grammars run inside the reasoning."""
 
+    backend: str | None
     reasoning_parser: str
     reasoning_parser_known: bool
     enable_in_reasoning: bool
@@ -178,6 +215,7 @@ class StructuredOutputsSection:
             _UNKNOWN if structured is None else getattr(structured, "reasoning_parser", _UNKNOWN)
         )
         return cls(
+            backend=None if structured is None else getattr(structured, "backend", None),
             reasoning_parser="" if parser is _UNKNOWN else str(parser or ""),
             reasoning_parser_known=parser is not _UNKNOWN,
             enable_in_reasoning=bool(getattr(structured, "enable_in_reasoning", False)),
@@ -194,6 +232,13 @@ class KvEventsSection:
     enable_kv_cache_events: bool
     publisher: Any
     endpoint: str
+    replay_endpoint: str
+    topic: str
+
+    @property
+    def relayed(self) -> bool:
+        """A ZMQ publisher is on: ``SubscribeKvEvents`` relays it."""
+        return self.config is not None and self.enable_kv_cache_events and self.publisher == "zmq"
 
     @classmethod
     def read(cls, vllm_config: Any) -> KvEventsSection:
@@ -203,6 +248,8 @@ class KvEventsSection:
             enable_kv_cache_events=bool(getattr(config, "enable_kv_cache_events", False)),
             publisher=getattr(config, "publisher", None),
             endpoint=str(getattr(config, "endpoint", "") or ""),
+            replay_endpoint=str(getattr(config, "replay_endpoint", "") or ""),
+            topic=str(getattr(config, "topic", "") or ""),
         )
 
 
@@ -219,6 +266,25 @@ class KvTransferSection:
     def read(cls, vllm_config: Any) -> KvTransferSection:
         config = getattr(vllm_config, "kv_transfer_config", None)
         return cls(config=config, role=str(getattr(config, "kv_role", None) or ""))
+
+
+@dataclasses.dataclass(frozen=True)
+class PoolerSection:
+    """``ModelConfig.pooler_config``: what vLLM's frontend merges into a pooling
+    request's unset fields; absent on most generation models."""
+
+    use_activation: bool | None
+    dimensions: int | None
+
+    @classmethod
+    def read(cls, vllm_config: Any) -> PoolerSection:
+        pooler = getattr(getattr(vllm_config, "model_config", None), "pooler_config", None)
+        use_activation = getattr(pooler, "use_activation", None)
+        dimensions = getattr(pooler, "dimensions", None)
+        return cls(
+            use_activation=None if use_activation is None else bool(use_activation),
+            dimensions=None if dimensions is None else int(dimensions),
+        )
 
 
 class EngineConfigView:
@@ -287,3 +353,12 @@ class EngineConfigView:
     @cached_property
     def kv_transfer(self) -> KvTransferSection:
         return KvTransferSection.read(self._config)
+
+    @cached_property
+    def pooler(self) -> PoolerSection:
+        return PoolerSection.read(self._config)
+
+    @cached_property
+    def launch(self) -> LaunchSection:
+        """The process manager's inputs; required of the config."""
+        return LaunchSection.read(self._config)
