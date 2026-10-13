@@ -1069,7 +1069,9 @@ struct CliArgs {
     #[arg(long, default_value_t = 90, help_heading = "Request Handling")]
     idle_connection_timeout_secs: u64,
 
-    /// CORS allowed origins
+    /// Origins a browser may call the gateway from (exact origins,
+    /// space-separated), or `*` alone for any origin. Without this flag the
+    /// gateway makes no cross-origin allowance
     #[arg(long, num_args = 0.., help_heading = "Request Handling")]
     cors_allowed_origins: Vec<String>,
 
@@ -2165,33 +2167,8 @@ impl CliArgs {
             value: value.to_string(),
             reason: reason.to_string(),
         };
-        for origin in &self.cors_allowed_origins {
-            // Exactly what a browser sends as `Origin`: the scheme and the host
-            // in lower case, no userinfo, no default port, nothing after the
-            // authority (not even `/`); anything else never matches the exact
-            // comparison of the CORS layer.
-            let default_port = |scheme: &str| match scheme {
-                "http" | "ws" => Some(80),
-                "https" | "wss" => Some(443),
-                _ => None,
-            };
-            let parsed = http::Uri::try_from(origin.as_str()).ok().filter(|uri| {
-                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
-                    if origin.as_str() == format!("{scheme}://{authority}")
-                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
-                        && !authority.as_str().contains('@')
-                        && authority
-                            .port_u16()
-                            .is_none_or(|port| Some(port) != default_port(scheme)))
-            });
-            if parsed.is_none() || http::HeaderValue::from_str(origin).is_err() {
-                return Err(invalid(
-                    "cors_allowed_origins",
-                    origin,
-                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
-                ));
-            }
-        }
+        // `cors_allowed_origins` is checked by the shared `ConfigValidator`, which
+        // every construction path runs (this CLI through `builder.build()`).
         if !self.health_check_endpoint.starts_with('/') {
             return Err(invalid(
                 "health_check_endpoint",
@@ -2966,6 +2943,10 @@ mod tests {
                 vec!["--request-id-headers", "bad header"],
                 "request_id_headers",
             ),
+            (
+                vec!["--cors-allowed-origins", "*", "https://example.com"],
+                "cors_allowed_origins",
+            ),
             (vec!["--api-key", ""], "api_key"),
             (vec!["--jwt-role-mapping", "noeq"], "jwt_role_mapping"),
             (vec!["--jwt-role-mapping", "ops=root"], "jwt_role_mapping"),
@@ -2999,6 +2980,9 @@ mod tests {
         ])
         .to_router_config(vec![], vec![])
         .expect("well-formed values pass");
+        cli_args_from(&["--cors-allowed-origins", "*"])
+            .to_router_config(vec![], vec![])
+            .expect("a lone '*' is the open policy");
     }
 
     /// A flag that only acts with a companion is named when the companion is
