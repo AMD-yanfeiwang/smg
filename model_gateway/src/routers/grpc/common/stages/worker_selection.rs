@@ -1,7 +1,6 @@
 //! Worker selection stage: Select appropriate worker(s) based on routing mode
 
 use std::{
-    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -14,16 +13,17 @@ use axum::{
 use tracing::{debug, error, warn};
 
 use super::{helpers, PipelineStage};
+#[cfg(test)]
+use crate::observability::log_throttle::KeyedLogThrottle;
 use crate::{
-    middleware::{tenant_resolution::AcceptedAt, ReportedRefusal, SHED_RETRY_AFTER_SECS},
-    observability::{
-        log_throttle::KeyedLogThrottle,
-        metrics::{metrics_labels, Metrics},
-    },
+    middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
+    observability::metrics::{metrics_labels, Metrics},
     policies::{CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerLeg},
     routers::{
         common::{
-            placement::{self, CandidateFilter, PairFailure, PlacementFailure, PlacementInputs},
+            placement::{
+                self, CandidateFilter, PairFailure, PlacementFailure, PlacementInputs, RefusalSite,
+            },
             retry::mark_non_retryable,
         },
         error,
@@ -99,26 +99,6 @@ type EncodePrefillDecodeWorkerSelection = (
 /// selection because it had already waited longer than the queue timeout
 /// inside the gateway.
 pub(crate) const SELECTION_QUEUE_TIMEOUT_ERROR_CODE: &str = "selection_queue_timeout";
-
-/// Lines per second and per model the stage writes for refusals of a model
-/// whose workers are all unavailable (`no_available_workers`). One line per
-/// refusal, with the request id, the model and the pool's state, shows the
-/// condition and whom it hits; past this rate the lines are counted and the
-/// next one carries the count, while `smg_router_request_errors_total`
-/// keeps the volume. A client retrying at once against a drained pool drew
-/// about two thousand refusals a second, three ERROR lines each, before.
-const NO_AVAILABLE_WORKERS_LINES_PER_SECOND: u32 = 10;
-
-/// Models the refusal throttle tracks at once; past this the model seen
-/// least recently is forgotten (a model that is down keeps refusing, so it
-/// stays). One storming model never silences another's first line.
-const NO_AVAILABLE_WORKERS_LOG_MODELS: usize = 64;
-
-static NO_AVAILABLE_WORKERS_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
-    NO_AVAILABLE_WORKERS_LINES_PER_SECOND,
-    Duration::from_secs(1),
-    NO_AVAILABLE_WORKERS_LOG_MODELS,
-);
 
 /// Worker selection stage: Select appropriate worker(s) based on routing mode
 pub(crate) struct WorkerSelectionStage {
@@ -738,46 +718,6 @@ impl WorkerSelectionStage {
     }
 }
 
-/// What a refusal line says about the pools it drew from: per leg, the
-/// workers registered for the model, those healthy, and those routable
-/// (healthy, circuit closed, not vetoed by load or liveness).
-struct PoolState {
-    legs: Vec<LegState>,
-}
-
-struct LegState {
-    leg: &'static str,
-    workers: usize,
-    healthy: usize,
-    available: usize,
-}
-
-impl PoolState {
-    fn workers(&self) -> usize {
-        self.legs.iter().map(|leg| leg.workers).sum()
-    }
-
-    fn available(&self) -> usize {
-        self.legs.iter().map(|leg| leg.available).sum()
-    }
-}
-
-impl fmt::Display for PoolState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, leg) in self.legs.iter().enumerate() {
-            if i > 0 {
-                f.write_str(", ")?;
-            }
-            write!(
-                f,
-                "{} {}/{} available ({} healthy)",
-                leg.leg, leg.available, leg.workers, leg.healthy
-            )?;
-        }
-        Ok(())
-    }
-}
-
 /// Candidate predicate for requests carrying media references.
 fn accepts_media_refs(worker: &dyn Worker) -> bool {
     multimodal::worker_accepts_media_refs(worker)
@@ -994,12 +934,6 @@ impl WorkerSelectionStage {
         if unavailable {
             return Self::workers_unavailable(model_id);
         }
-        error!(
-            function = "WorkerSelectionStage::execute",
-            mode = ?self.mode,
-            model_id = %model_id,
-            "No worker serves model"
-        );
         error::model_not_found(model_id)
     }
 
@@ -1060,12 +994,6 @@ impl WorkerSelectionStage {
         if unavailable {
             return Self::workers_unavailable(model_id);
         }
-        error!(
-            function = "WorkerSelectionStage::execute",
-            mode = ?self.mode,
-            model_id = %model_id,
-            "No worker serves model"
-        );
         error::model_not_found(model_id)
     }
 
@@ -1096,103 +1024,97 @@ impl WorkerSelectionStage {
     /// clients the model was gone while its workers restarted. Terminal for
     /// the pipeline's own retry loop (see `placement::no_available_workers`).
     /// Logged by [`Self::report_refusal`] at the stage's entry points, once
-    /// per refusal and rate-limited, not here.
+    /// per refusal and rate-limited, not here; so is the 404 of a model
+    /// nobody serves.
     fn workers_unavailable(model_id: &str) -> Response {
-        placement::no_available_workers(format!(
-            "All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"
-        ))
+        placement::no_available_workers(Self::workers_unavailable_message(model_id))
     }
 
-    /// The log line of a `no_available_workers` refusal, and its marker.
-    ///
-    /// One WARN per refusal with the refusing function, the request id, the
-    /// model and the state of the pools the stage draws from, capped per
-    /// model at [`NO_AVAILABLE_WORKERS_LINES_PER_SECOND`]; a line past the
-    /// cap is counted and the next admitted line for that model carries the
-    /// count as `suppressed`. The response is marked [`ReportedRefusal`], so
-    /// the pipeline's lines and the access log's response line drop to DEBUG
-    /// for it: a refusal is the gateway's normal answer to "no worker right
-    /// now", not a fault of its own, and three ERROR lines per refusal made
-    /// a client's retry loop against a drained pool a log storm. The error
-    /// counter (`smg_router_request_errors_total`, recorded by the pipeline)
-    /// keeps the volume. Every other refusal passes through unchanged.
-    fn report_refusal(
+    /// [`Self::workers_unavailable`] with the verdict the stage has as its
+    /// line's reason (the policy that declined a leg, the leg at its
+    /// admission limit); the client's message stays the one above.
+    fn workers_unavailable_because(model_id: &str, reason: String) -> Response {
+        placement::no_available_workers_because(Self::workers_unavailable_message(model_id), reason)
+    }
+
+    fn workers_unavailable_message(model_id: &str) -> String {
+        format!(
+            "All workers for model '{model_id}' are unavailable (unhealthy or circuit breaker open)"
+        )
+    }
+
+    /// The line and marker of a refusal the stage answers on its own: a
+    /// `no_available_workers` 503 or a `model_not_found` 404, reported once
+    /// per refusal through [`placement::report_refusal`] with the stage's
+    /// mode and the pools it draws from, under the model's allowance. Called
+    /// at the stage's entry points and by the pipeline for a refusal another
+    /// stage answered unreported (the preparation stage's 404 for a model
+    /// nobody serves). Every other response, and a refusal already marked,
+    /// passes through unchanged.
+    pub(crate) fn report_refusal(
         &self,
         function: &'static str,
         request_id: Option<&str>,
         model_id: &str,
         refusal: Response,
     ) -> Response {
-        self.report_refusal_with(
-            &NO_AVAILABLE_WORKERS_LOG,
-            function,
+        placement::report_refusal(
+            &self.worker_registry,
+            self.refusal_site(function),
             request_id,
             model_id,
             refusal,
         )
     }
 
-    /// [`Self::report_refusal`] under an explicit throttle. The id is a
-    /// field only when the caller has one: the request's span carries it
-    /// too, and an empty field would read as an id.
+    /// [`Self::report_refusal`] under an explicit throttle: the tests' own,
+    /// so their counts do not depend on the process-wide allowance.
+    #[cfg(test)]
     fn report_refusal_with(
         &self,
         throttle: &KeyedLogThrottle,
         function: &'static str,
         request_id: Option<&str>,
         model_id: &str,
-        mut refusal: Response,
+        refusal: Response,
     ) -> Response {
-        if error::extract_error_code_from_response(&refusal) != placement::NO_AVAILABLE_WORKERS_CODE
-        {
-            return refusal;
-        }
-        refusal.extensions_mut().insert(ReportedRefusal);
-        if let Some(admitted) = throttle.admit(model_id) {
-            let pool = self.pool_state(model_id);
-            warn!(
-                function,
-                request_id = request_id,
-                mode = ?self.mode,
-                model_id = %model_id,
-                workers = pool.workers(),
-                available = pool.available(),
-                pool = %pool,
-                suppressed = admitted.suppressed,
-                "No available workers for model"
-            );
-        }
-        refusal
+        placement::report_refusal_under(
+            throttle,
+            &self.worker_registry,
+            self.refusal_site(function),
+            request_id,
+            model_id,
+            refusal,
+        )
     }
 
-    /// The pools the stage's mode draws from for `model_id`, as the refusal
-    /// line reports them.
-    fn pool_state(&self, model_id: &str) -> PoolState {
-        let legs: &[(&'static str, RoutingPool)] = match self.mode {
-            WorkerSelectionMode::Regular => &[("regular", RoutingPool::GrpcPipelineRegular)],
-            WorkerSelectionMode::PrefillDecode => &[
-                ("prefill", RoutingPool::GrpcPrefill),
-                ("decode", RoutingPool::GrpcDecode),
-            ],
-            WorkerSelectionMode::EncodePrefillDecode => &[
-                ("encode", RoutingPool::GrpcEncode),
-                ("prefill", RoutingPool::GrpcPrefill),
-                ("decode", RoutingPool::GrpcDecode),
-            ],
+    /// How the stage's refusal line names the stage and the pools its mode
+    /// draws from.
+    fn refusal_site(&self, function: &'static str) -> RefusalSite<'static> {
+        let (mode, legs): (&'static str, &'static [(&'static str, RoutingPool)]) = match self.mode {
+            WorkerSelectionMode::Regular => {
+                ("Regular", &[("regular", RoutingPool::GrpcPipelineRegular)])
+            }
+            WorkerSelectionMode::PrefillDecode => (
+                "PrefillDecode",
+                &[
+                    ("prefill", RoutingPool::GrpcPrefill),
+                    ("decode", RoutingPool::GrpcDecode),
+                ],
+            ),
+            WorkerSelectionMode::EncodePrefillDecode => (
+                "EncodePrefillDecode",
+                &[
+                    ("encode", RoutingPool::GrpcEncode),
+                    ("prefill", RoutingPool::GrpcPrefill),
+                    ("decode", RoutingPool::GrpcDecode),
+                ],
+            ),
         };
-        PoolState {
-            legs: legs
-                .iter()
-                .map(|(leg, pool)| {
-                    let workers = self.worker_registry.get_routing_pool(model_id, *pool);
-                    LegState {
-                        leg,
-                        workers: workers.len(),
-                        healthy: workers.iter().filter(|w| w.is_healthy()).count(),
-                        available: workers.iter().filter(|w| w.is_available()).count(),
-                    }
-                })
-                .collect(),
+        RefusalSite {
+            function,
+            mode,
+            legs,
         }
     }
 
@@ -1244,12 +1166,25 @@ impl WorkerSelectionStage {
     /// as it was built and counted once; a leg nobody serves is a 404, and a
     /// leg whose workers are all unavailable is the 503 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
+        let leg = match failure.leg {
+            WorkerLeg::Prefill => "prefill",
+            WorkerLeg::Decode => "decode",
+            WorkerLeg::Single => "worker",
+        };
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => shed,
+            PlacementFailure::Unavailable => Self::workers_unavailable(model_id),
+            // The client reads the 503's usual message; the line names the
+            // policy and the leg, as the HTTP PD router's does.
+            PlacementFailure::PolicyDeclined(policy) => Self::workers_unavailable_because(
+                model_id,
+                format!("Policy {policy} failed to select a {leg} worker"),
+            ),
             // Admission turns a capacity verdict into a wait before it gets here.
-            PlacementFailure::Unavailable
-            | PlacementFailure::PolicyDeclined(_)
-            | PlacementFailure::PrefillAtCapacity => Self::workers_unavailable(model_id),
+            PlacementFailure::PrefillAtCapacity => Self::workers_unavailable_because(
+                model_id,
+                format!("No {leg} workers below their Prefill admission limit"),
+            ),
             PlacementFailure::NoCompatiblePair {
                 prefill,
                 decode,
@@ -1273,16 +1208,7 @@ impl WorkerSelectionStage {
                     ),
                 )
             }
-            PlacementFailure::NoCandidates => {
-                error!(
-                    function = "WorkerSelectionStage::execute",
-                    mode = ?self.mode,
-                    model_id = %model_id,
-                    leg = ?failure.leg,
-                    "No worker serves model"
-                );
-                error::model_not_found(model_id)
-            }
+            PlacementFailure::NoCandidates => error::model_not_found(model_id),
         }
     }
 
@@ -1779,7 +1705,7 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         mesh::adapters::tree_sync::RepairEntry,
-        middleware::TenantRequestMeta,
+        middleware::{ReportedRefusal, TenantRequestMeta},
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::{
             common::{attempt_ledger::AttemptLedger, retry::is_retryable_response},
@@ -5108,7 +5034,7 @@ mod tests {
         down.set_status(WorkerStatus::NotReady);
         registry.register(down).unwrap();
         let stage = regular_stage(Arc::clone(&registry));
-        let allowance = usize::try_from(NO_AVAILABLE_WORKERS_LINES_PER_SECOND).unwrap();
+        let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();
 
         // The stage's entry point marks and reports the refusal.
         let mut ctx = prepared_ctx(Arc::clone(&registry), None);
@@ -5129,9 +5055,9 @@ mod tests {
         // Under a throttle of its own (the process-wide one is shared with
         // every other test), the lines are exactly the allowance per model.
         let throttle = KeyedLogThrottle::new(
-            NO_AVAILABLE_WORKERS_LINES_PER_SECOND,
+            placement::REFUSAL_LINES_PER_SECOND,
             Duration::from_secs(60),
-            NO_AVAILABLE_WORKERS_LOG_MODELS,
+            placement::REFUSAL_LOG_MODELS,
         );
         refusal_lines.store(0, Ordering::Relaxed);
         let refusals = 5 * allowance;
@@ -5173,6 +5099,140 @@ mod tests {
             errors.load(Ordering::Relaxed),
             0,
             "a refusal is not an error of the gateway"
+        );
+    }
+
+    /// A model nobody serves is refused with the `model_not_found` 404,
+    /// marked as reported for the loggers downstream, and written at WARN
+    /// within the per-second allowance, never at ERROR: a client retrying a
+    /// wrong model name at once is the same storm as a drained pool.
+    #[tokio::test]
+    async fn a_refusal_for_a_model_nobody_serves_is_marked_and_written_at_warn_within_the_allowance(
+    ) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::Registry::default().with(RefusalLineCounter {
+                errors: Arc::clone(&errors),
+                refusal_lines: Arc::clone(&refusal_lines),
+            }),
+        );
+        let registry = Arc::new(WorkerRegistry::new());
+        let stage = regular_stage(Arc::clone(&registry));
+        let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();
+
+        // The entry point marks and reports the refusal.
+        let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+        let refused = stage
+            .execute(&mut ctx)
+            .await
+            .expect_err("nobody serves the model");
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::MODEL_NOT_FOUND_CODE
+        );
+        assert!(
+            refused.extensions().get::<ReportedRefusal>().is_some(),
+            "the refusal is marked as reported, so the pipeline and the access log keep quiet"
+        );
+
+        // Under a throttle of its own, exactly the allowance of lines.
+        let throttle = KeyedLogThrottle::new(
+            placement::REFUSAL_LINES_PER_SECOND,
+            Duration::from_secs(60),
+            placement::REFUSAL_LOG_MODELS,
+        );
+        refusal_lines.store(0, Ordering::Relaxed);
+        let refusals = 5 * allowance;
+        for _ in 0..refusals {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            let refused = stage
+                .select(&mut ctx)
+                .await
+                .expect_err("nobody serves the model");
+            let reported = stage.report_refusal_with(
+                &throttle,
+                "WorkerSelectionStage::execute",
+                None,
+                "test-model",
+                refused,
+            );
+            assert!(reported.extensions().get::<ReportedRefusal>().is_some());
+        }
+        assert_eq!(
+            refusal_lines.load(Ordering::Relaxed),
+            allowance,
+            "{refusals} refusals of a model nobody serves write exactly {allowance} lines"
+        );
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "a model nobody serves is the client's mistake, not an error of the gateway"
+        );
+    }
+
+    /// A pair placement the policy declined, or one every prefill is at its
+    /// admission limit for, is refused with the 503's usual message for the
+    /// client and the verdict as its line's reason, naming the policy and
+    /// the leg: the fixed "unavailable" message said the workers were down
+    /// while the pool state on the same line showed them available.
+    #[tokio::test]
+    async fn a_pair_the_policy_declined_is_refused_with_the_policy_as_the_lines_reason() {
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+
+        let declined = stage.pair_failure(
+            "test-model",
+            PairFailure {
+                leg: WorkerLeg::Prefill,
+                verdict: PlacementFailure::PolicyDeclined("cache_aware"),
+            },
+        );
+        assert_eq!(declined.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&declined),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert_eq!(
+            placement::refusal_reason(&declined),
+            Some("Policy cache_aware failed to select a prefill worker")
+        );
+
+        let at_capacity = stage.pair_failure(
+            "test-model",
+            PairFailure {
+                leg: WorkerLeg::Prefill,
+                verdict: PlacementFailure::PrefillAtCapacity,
+            },
+        );
+        assert_eq!(
+            placement::refusal_reason(&at_capacity),
+            Some("No prefill workers below their Prefill admission limit")
+        );
+
+        let unavailable = stage.pair_failure(
+            "test-model",
+            PairFailure {
+                leg: WorkerLeg::Decode,
+                verdict: PlacementFailure::Unavailable,
+            },
+        );
+        assert_eq!(
+            placement::refusal_reason(&unavailable),
+            Some("All workers for model 'test-model' are unavailable (unhealthy or circuit breaker open)"),
+            "a leg that is down keeps the message as its reason"
+        );
+
+        let body = axum::body::to_bytes(declined.into_body(), usize::MAX)
+            .await
+            .expect("the body is in memory");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON error envelope");
+        assert_eq!(
+            body["error"]["message"],
+            "All workers for model 'test-model' are unavailable (unhealthy or circuit breaker open)",
+            "the client's message is unchanged"
         );
     }
 }

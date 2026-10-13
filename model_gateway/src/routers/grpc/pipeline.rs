@@ -458,9 +458,19 @@ impl RequestPipeline {
     async fn run_ingress(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         macro_rules! step {
             ($stage:expr, $result:expr) => {
-                $result.inspect_err(|response: &Response| {
+                $result.map_err(|response: Response| {
+                    // A refusal the failing stage did not report itself (the
+                    // preparation stage's 404 for a model nobody serves)
+                    // gets its one rate-limited line here; a reported one,
+                    // and every other failure, passes through.
+                    let response = self.stages.worker_selection.report_refusal(
+                        "RequestPipeline::run_ingress",
+                        helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref()),
+                        &ctx.input.model_id,
+                        response,
+                    );
                     if response.extensions().get::<ReportedRefusal>().is_some() {
-                        // The stage wrote the one line this refusal gets
+                        // The one line this refusal gets was written
                         // (rate-limited, with the pool's state).
                         debug!(
                             "Stage {} refused the request with status {}",
@@ -470,6 +480,7 @@ impl RequestPipeline {
                     } else {
                         error!("Stage {} failed with status {}", $stage, response.status());
                     }
+                    response
                 })
             };
         }
@@ -4166,6 +4177,72 @@ mod request_release_tests {
         let line = regular_worker_error_line(&rendered);
         assert!(line.contains("error_type=\"engine_error\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A completion for a model nobody serves and no tokenizer knows is
+    /// refused by the preparation stage with the 404, before selection: the
+    /// pipeline reports it once (the response marked, so the stage line and
+    /// the access log keep quiet) and writes no ERROR event. The one refusal
+    /// path a stage-level test cannot reach.
+    #[tokio::test]
+    async fn a_404_from_the_preparation_stage_is_reported_once_and_marked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ErrorCounter(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorCounter {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::ERROR {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let errors = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(ErrorCounter(Arc::clone(&errors))),
+        );
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = Arc::new(SharedComponents {
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            worker_registry,
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: utils::ParserResolver::disabled(),
+            multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+        });
+
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                "nobody-serves-this".to_string(),
+                components,
+                None,
+                None,
+                Some(&fast_retry_config(1)),
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::MODEL_NOT_FOUND_CODE
+        );
+        assert!(
+            response.extensions().get::<ReportedRefusal>().is_some(),
+            "the pipeline reported the 404, so the stage line and the access log keep quiet"
+        );
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "a model nobody serves is the client's mistake, not an error of the gateway"
+        );
     }
 }
 
