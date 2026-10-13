@@ -561,6 +561,8 @@ async fn execute_pd_dispatch(
 /// liveness monitor, as a regular dispatch's does. The legs join no tracked
 /// pile and add no prefill backlog: those are the regular dispatch's rules,
 /// and a disaggregated request is admitted through its prefill guard. The
+/// decode leg's dispatch success is sampled on its worker's breaker at the
+/// leg's first response (see [`ProtoStream::tracked_decode_leg`]). The
 /// sequential dispatch's prefill stream is drained already; the wrapper is a
 /// no-op on it.
 fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> ExecutionResult {
@@ -578,9 +580,13 @@ fn attribute_pd_legs(result: ExecutionResult, workers: &WorkerSelection) -> Exec
         Some(worker) => stream.tracked(Arc::clone(worker), 0, false),
         None => stream,
     };
+    let decode = match workers.decode_worker() {
+        Some(worker) => (*decode).tracked_decode_leg(Arc::clone(worker)),
+        None => *decode,
+    };
     ExecutionResult::PrefillDecode {
         prefill: attribute(prefill, workers.prefill_worker()),
-        decode: Box::new(attribute(*decode, workers.decode_worker())),
+        decode: Box::new(decode),
         prefill_guards,
         pd_timing,
         prefill_input_logprobs,
@@ -1294,8 +1300,9 @@ fn pd_leg_error(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Retirement {
     /// Its partner failed to start, and the request with it. The leg's own
-    /// late result is still this request's one word on its worker: sampled
-    /// on the breaker and counted as a dispatch's is.
+    /// late failure is still this request's one word on its worker: sampled
+    /// on the breaker and counted as a dispatch's is. A late stream is
+    /// aborted and earns no success: the leg never produced anything.
     PartnerFailed,
     /// Its partner, the prefill, fell silent: the request charged that
     /// prefill where its bound passed, and this leg's late result is not its
@@ -1342,9 +1349,11 @@ impl Retirement {
 /// and it is the only thing that releases that room early. The abort is
 /// deferred only when a KV handoff may still be written into the leg: the
 /// decode partner of a prefill that fell silent rather than failed; a peer
-/// that failed to start writes nothing. The late result is sampled and
+/// that failed to start writes nothing. A late failure is sampled and
 /// counted only when it is the request's one word on the worker; a leg
 /// given up on for its silence charged its worker when the bound passed.
+/// A late stream earns no success either way: the leg is aborted before it
+/// produced anything.
 #[expect(
     clippy::disallowed_methods,
     reason = "the abandoned PD leg is retired off the request path; its dispatch is bounded by the engine's own deadline"
@@ -1358,7 +1367,10 @@ fn retire_pd_leg(
 ) {
     tokio::spawn(async move {
         let result = dispatch.await;
-        if let Some(status) = result.breaker_status().filter(|_| retirement.charges()) {
+        if let Some(status) = result
+            .breaker_status()
+            .filter(|_| retirement.charges() && result.is_err())
+        {
             worker.record_outcome(status);
         }
         let cause = retirement.cause();
@@ -1559,15 +1571,16 @@ fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> 
 }
 
 /// The breaker samples of a parallel dispatch whose two legs both answered
-/// (client errors don't count as failures). A prefill dispatch that
-/// succeeded is sampled once its first response is in, as the sequential
-/// path samples it after the drain: a leg that was accepted into silence is
-/// one failure of its worker, not a success and then a failure, which would
-/// reset the breaker's streak every time. A prefill dispatch that ended
-/// with the decode verdict (its partner had stalled while the decode's own
-/// call had already returned its stream) is charged where the verdict put
-/// it, the decode, and that decode's dispatch is no success beside the
-/// verdict that gave up on it.
+/// (client errors don't count as failures). A dispatch that succeeded is
+/// sampled once the leg's first response is in: the prefill's where its
+/// first response is awaited, as the sequential path samples it after the
+/// drain; the decode's by the tracked leg (`attribute_pd_legs`), since its
+/// first response waits for the handoff. A leg that was accepted into
+/// silence, or whose stream fails at once, is one failure of its worker,
+/// not a success and then a failure, which would reset the breaker's streak
+/// every time. A prefill dispatch that ended with the decode verdict (its
+/// partner had stalled while the decode's own call had already returned its
+/// stream) is charged where the verdict put it, the decode.
 fn record_pd_dispatch_outcomes(
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
@@ -1581,7 +1594,9 @@ fn record_pd_dispatch_outcomes(
             prefill_result
                 .breaker_status()
                 .filter(|_| prefill_result.is_err()),
-            decode_result.breaker_status(),
+            decode_result
+                .breaker_status()
+                .filter(|_| decode_result.is_err()),
         ),
     }
 }
@@ -2219,7 +2234,9 @@ async fn execute_sequential_pd(
         )
     })?;
 
-    workers.record_outcome_decode(ledger, 200);
+    // The decode worker's breaker success is sampled at the leg's first
+    // response, by the tracked leg (`attribute_pd_legs`): the call returning
+    // its stream says nothing about the handoff the first token waits for.
     // Decode established: record the success-only PD metrics here.
     Metrics::record_pd_kv_connector_mode(kv_connector_label);
     Metrics::record_pd_prefill_duration(
@@ -2317,6 +2334,43 @@ mod tests {
         assert!(Retirement::PartnerFailed.charges());
         assert!(!Retirement::PartnerFailed.defer_abort());
         assert!(!Retirement::Silent.charges());
+    }
+
+    /// A leg retired because its partner failed to start samples only a late
+    /// failure on its worker: its late stream is aborted and earns no success
+    /// (the leg never produced anything), so a failure before it stands and
+    /// the next one opens a breaker set to two.
+    #[tokio::test]
+    async fn the_late_stream_of_a_leg_retired_for_its_partners_failure_earns_no_breaker_success() {
+        use crate::worker::circuit_breaker::CircuitState;
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30002")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        decode.record_outcome(504);
+        let late: PdLegDispatch =
+            Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
+        retire_pd_leg(
+            PdLeg::Decode,
+            "grpc",
+            Arc::clone(&decode),
+            late,
+            Retirement::PartnerFailed,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+        decode.record_outcome(504);
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::Open,
+            "the late stream earned no success between the two failures"
+        );
     }
 
     fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
