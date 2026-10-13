@@ -223,6 +223,21 @@ impl PostgresStore {
             .await?;
         }
 
+        // The index an earlier release built over `::jsonb` refused every row
+        // whose object carries the escape `\u0000`: it goes on every start
+        // (a no-op once gone); an existing table gets the replacement from its
+        // operator, concurrently (see the release note).
+        tx.batch_execute(&PostgresResponseStorage::legacy_unstored_index_drop_ddl(
+            schema,
+        ))
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to drop the earlier unstored response index: {}",
+                describe_error(&e)
+            )
+        })?;
+
         // The indexes last, so the share lock a `CREATE INDEX IF NOT EXISTS`
         // takes on its table is not held while the migrations wait for their
         // own locks: the links index on columns the table always has, then
@@ -1207,7 +1222,10 @@ impl PostgresResponseStorage {
 
     /// The index behind [`ResponseStorage::delete_unstored_older_than`]: the
     /// object's status, over the unstored records only, so a sweep reads
-    /// those rows and no other. Its expressions are the sweep's predicate.
+    /// those rows and no other. Its expressions are the sweep's predicate,
+    /// read through [`nul_safe_json_text`]: an index over `::jsonb` refused
+    /// every row whose object carries the escape `\u0000` (a model's or a
+    /// client's text can), so that form is not used.
     pub(crate) fn unstored_index_ddl(schema: &SchemaConfig) -> Option<String> {
         let s = &schema.responses;
         if s.is_skipped("raw_response") {
@@ -1215,10 +1233,53 @@ impl PostgresResponseStorage {
         }
         let table = s.qualified_table(schema.owner.as_deref());
         let col_raw = s.col("raw_response");
+        let status = nul_safe_json_text(col_raw, "status");
+        let store = nul_safe_json_text(col_raw, "store");
         Some(format!(
-            "CREATE INDEX IF NOT EXISTS responses_unstored_idx ON {table} (({col_raw}::jsonb->>'status')) \
-             WHERE ({col_raw}::jsonb->>'store') = 'false';"
+            "CREATE INDEX IF NOT EXISTS {UNSTORED_INDEX} ON {table} (({status})) WHERE {store} = 'false';"
         ))
+    }
+
+    /// The statement behind [`ResponseStorage::delete_unstored_older_than`]
+    /// (the cutoff bound as `$1`, epoch seconds): the unstored records in a
+    /// terminal status whose `completed_at` (or, without one, `created_at`)
+    /// lies before it. Its `store` and `status` reads are the index's own
+    /// expressions (see [`Self::unstored_index_ddl`]; a unit test holds them
+    /// together), so the planner matches the index. `None` when the schema
+    /// skips the object column (nothing to read).
+    pub(crate) fn unstored_sweep_sql(schema: &SchemaConfig) -> Option<String> {
+        let s = &schema.responses;
+        if s.is_skipped("raw_response") {
+            return None;
+        }
+        let table = s.qualified_table(schema.owner.as_deref());
+        let col_raw = s.col("raw_response");
+        let store = nul_safe_json_text(col_raw, "store");
+        let status = nul_safe_json_text(col_raw, "status");
+        let completed_at = nul_safe_json_text(col_raw, "completed_at");
+        let ended = if s.is_skipped("created_at") {
+            format!("({completed_at})::bigint")
+        } else {
+            format!(
+                "COALESCE(({completed_at})::bigint, EXTRACT(EPOCH FROM {})::bigint)",
+                s.col("created_at")
+            )
+        };
+        Some(format!(
+            "DELETE FROM {table} WHERE {store} = 'false' \
+             AND {status} IN ('completed', 'incomplete', 'failed', 'cancelled') \
+             AND {ended} < $1"
+        ))
+    }
+
+    /// The statement that drops the index an earlier release built over
+    /// `::jsonb` under [`LEGACY_UNSTORED_INDEX`], valid or not: with it on
+    /// the table no row whose object carries `\u0000` can be written.
+    pub(crate) fn legacy_unstored_index_drop_ddl(schema: &SchemaConfig) -> String {
+        match schema.owner.as_deref() {
+            Some(owner) => format!("DROP INDEX IF EXISTS {owner}.{LEGACY_UNSTORED_INDEX};"),
+            None => format!("DROP INDEX IF EXISTS {LEGACY_UNSTORED_INDEX};"),
+        }
     }
 
     pub fn build_response_from_row(
@@ -1313,22 +1374,25 @@ fn tenant_scope_sql(s: &crate::schema::TableConfig, param: usize) -> Option<Stri
 }
 
 /// The query behind [`ResponseStorage::find_response_by_output_item`]:
-/// `raw_response` is a native `JSON` column, so each row is cast to `jsonb`
-/// and asked whether its `output` array contains an item with the id bound as
-/// `$1`. `None` when the schema skips the column (nothing to search).
+/// `raw_response` is a native `JSON` column, so each row's document is read
+/// through [`nul_safe_json_document`] (the cast fails on a row whose object
+/// carries `\u0000`, and the predicate runs on every row the scan visits),
+/// cast to `jsonb` and asked whether its `output` array contains an item with
+/// the id bound as `$1`. `None` when the schema skips the column (nothing to
+/// search).
 fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
     let s = &schema.responses;
     if s.is_skipped("raw_response") {
         return None;
     }
-    let col_raw = s.col("raw_response");
+    let document = nul_safe_json_document(s.col("raw_response"));
     let order = if s.is_skipped("created_at") {
         String::new()
     } else {
         format!(" ORDER BY {} DESC", s.col("created_at"))
     };
     Some(format!(
-        "{select_base} WHERE {col_raw}::jsonb @> jsonb_build_object('output', \
+        "{select_base} WHERE {document}::jsonb @> jsonb_build_object('output', \
          jsonb_build_array(jsonb_build_object('id', $1::text))){order} LIMIT 1"
     ))
 }
@@ -1443,6 +1507,29 @@ fn link_sql(table: &str, col_names: &[&str]) -> String {
         "INSERT INTO {table} ({columns}) VALUES ({placeholders}) ON CONFLICT ({key}) DO UPDATE SET {}",
         updates.join(", ")
     )
+}
+
+/// The name of the index the unstored-record sweep reads.
+const UNSTORED_INDEX: &str = "responses_unstored_text_idx";
+/// The name an earlier release gave that index, built over `::jsonb`.
+const LEGACY_UNSTORED_INDEX: &str = "responses_unstored_idx";
+
+/// The JSON document in `col_raw` as text every stored object survives: the
+/// column's text with the escape `\u0000` replaced by `\u0020` (a space), to
+/// be parsed as `json` or `jsonb` after. A `::jsonb` cast, and `->>` on a
+/// `json` value, both fail on an object that carries that escape anywhere,
+/// and an index expression is evaluated for every row written and a lookup's
+/// predicate for every row scanned; the replacement keeps the text the same
+/// length and a literal backslash sequence in it valid, which replacing with
+/// nothing would not.
+fn nul_safe_json_document(col_raw: &str) -> String {
+    format!("replace({col_raw}::text, '\\u0000', '\\u0020')")
+}
+
+/// `field` of the JSON object in `col_raw` as text, read through
+/// [`nul_safe_json_document`].
+fn nul_safe_json_text(col_raw: &str, field: &str) -> String {
+    format!("{}::json->>'{field}'", nul_safe_json_document(col_raw))
 }
 
 /// The statement of the upsert path: the row is inserted, or every other
@@ -1746,29 +1833,11 @@ impl ResponseStorage for PostgresResponseStorage {
     }
 
     async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
-        let s = &self.store.schema.responses;
-
         // The object (its `store`, `status` and `completed_at`) is what the
         // query reads; without the column there is nothing to read.
-        if s.is_skipped("raw_response") {
+        let Some(sql) = Self::unstored_sweep_sql(&self.store.schema) else {
             return Ok(0);
-        }
-
-        let table = s.qualified_table(self.store.schema.owner.as_deref());
-        let col_raw = s.col("raw_response");
-        let ended = if s.is_skipped("created_at") {
-            format!("({col_raw}::jsonb->>'completed_at')::bigint")
-        } else {
-            format!(
-                "COALESCE(({col_raw}::jsonb->>'completed_at')::bigint, EXTRACT(EPOCH FROM {})::bigint)",
-                s.col("created_at")
-            )
         };
-        let sql = format!(
-            "DELETE FROM {table} WHERE {col_raw}::jsonb->>'store' = 'false' \
-             AND {col_raw}::jsonb->>'status' IN ('completed', 'incomplete', 'failed', 'cancelled') \
-             AND {ended} < $1"
-        );
 
         let client = self
             .store
@@ -1824,6 +1893,37 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The sweep's statement reads `store` and `status` through the very
+    /// expressions its index is built on (a drift between the two would leave
+    /// the planner without the index, and the sweep scanning the table), and
+    /// the lookup by output item reads the document through the same NUL-safe
+    /// form.
+    #[test]
+    fn the_sweep_s_predicate_is_the_index_s_expressions() {
+        let schema = SchemaConfig::default();
+        let ddl = PostgresResponseStorage::unstored_index_ddl(&schema)
+            .expect("the default schema keeps the object column");
+        let sweep = PostgresResponseStorage::unstored_sweep_sql(&schema)
+            .expect("the default schema keeps the object column");
+        let col_raw = schema.responses.col("raw_response");
+        let status = nul_safe_json_text(col_raw, "status");
+        let store = nul_safe_json_text(col_raw, "store");
+        assert!(ddl.contains(&format!("(({status}))")), "{ddl}");
+        assert!(ddl.contains(&format!("WHERE {store} = 'false'")), "{ddl}");
+        assert!(
+            sweep.contains(&format!("WHERE {store} = 'false'")),
+            "{sweep}"
+        );
+        assert!(sweep.contains(&format!("AND {status} IN (")), "{sweep}");
+        assert!(!sweep.contains("::jsonb"), "{sweep}");
+        let lookup = find_by_output_item_sql(&schema, "SELECT id FROM responses")
+            .expect("the default schema keeps the object column");
+        assert!(
+            lookup.contains(&format!("{}::jsonb @>", nul_safe_json_document(col_raw))),
+            "{lookup}"
+        );
+    }
 
     #[test]
     fn parse_metadata_none_returns_ok_none() {
