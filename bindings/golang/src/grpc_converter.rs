@@ -1,6 +1,7 @@
 //! gRPC response converter FFI functions
 
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString},
     os::raw::{c_char, c_int},
     ptr,
@@ -14,7 +15,6 @@ use openai_protocol::common::{
 use serde_json::Value;
 use smg::routers::grpc::utils::create_stop_decoder;
 use smg_grpc_client::sglang_proto as proto;
-use tokio::sync::Mutex as TokioMutex;
 use tool_parser::{types::ToolCallItem, ToolParser};
 
 use super::{
@@ -31,7 +31,8 @@ use super::{
 #[repr(C)]
 pub struct GrpcResponseConverterHandle {
     pub(crate) tokenizer: Arc<dyn Tokenizer>,
-    pub(crate) tool_parser: Option<Arc<TokioMutex<Box<dyn ToolParser>>>>,
+    /// The tool parser of each choice, by choice index (see `tool_parser_output`).
+    pub(crate) tool_parsers: HashMap<u32, Option<Box<dyn ToolParser>>>,
     pub(crate) stop: Option<StringOrArray>,
     pub(crate) stop_token_ids: Option<Vec<u32>>,
     pub(crate) model: String,
@@ -146,20 +147,12 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_create(
         serde_json::from_str::<Vec<u32>>(ids_str).ok()
     };
 
-    // Create tool parser if tools are provided: the model's, or the generic
-    // reader of a forced choice (see `forced_tool_choice`).
-    let tool_parser = if tools.is_some() {
-        tool_parser_for(model_str, tool_choice.as_ref()).map(|p| Arc::new(TokioMutex::new(p)))
-    } else {
-        None
-    };
-
     // Get system fingerprint from model (simplified)
     let system_fingerprint = Some("fp_placeholder".to_string()); // TODO: Get actual fingerprint
 
     Box::into_raw(Box::new(GrpcResponseConverterHandle {
         tokenizer,
-        tool_parser,
+        tool_parsers: HashMap::new(),
         stop,
         stop_token_ids,
         model: model_str.to_string(),
@@ -280,47 +273,59 @@ pub unsafe extern "C" fn sgl_grpc_response_converter_convert_chunk(
     }
 }
 
-/// The request's tool parser as the handle holds it.
-type SharedToolParser = Arc<TokioMutex<Box<dyn ToolParser>>>;
-
-/// The request's tool parser, when one reads this stream: tools declared, a
-/// parser configured, and a tool choice that allows calls.
-fn active_tool_parser(
-    handle: &GrpcResponseConverterHandle,
-) -> Option<(&[Tool], &SharedToolParser)> {
-    if matches!(
-        handle.tool_choice.as_ref(),
-        Some(ToolChoice::Value(ToolChoiceValue::None))
-    ) {
-        return None;
-    }
-    match (handle.tools.as_deref(), handle.tool_parser.as_ref()) {
-        (Some(tools), Some(parser)) => Some((tools, parser)),
-        _ => None,
-    }
+/// Whether a tool parser reads this stream: tools declared and a tool choice
+/// that allows calls.
+fn tool_parsing_on(handle: &GrpcResponseConverterHandle) -> bool {
+    handle.tools.is_some()
+        && !matches!(
+            handle.tool_choice.as_ref(),
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        )
 }
 
-/// What the parser released for `text`: its text (a value that is not a
-/// declared call, a marker prefix) and its calls, both empty while it holds
-/// the text as a prospective call. `None` when no parser reads the stream:
-/// the text is content as it is. A parser error keeps the converter's
+/// What the choice's parser released for `text`: its text (a value that is
+/// not a declared call, a marker prefix) and its calls, both empty while it
+/// holds the text as a prospective call. `None` when no parser reads the
+/// stream: the text is content as it is. A parser error keeps the converter's
 /// fallback: the text is content.
+///
+/// Every choice of an `n > 1` request has its own parser, created on the
+/// choice's first text from the request's tool choice (the model's parser, or
+/// the generic reader of a forced choice, see `tool_parser_for`) and owned by
+/// the handle, as the gateway's streaming path owns its parsers: a parser's
+/// state, its buffer and whether it announced a call's name, belongs to one
+/// choice, so the choices never share one.
 async fn tool_parser_output(
-    handle: &GrpcResponseConverterHandle,
+    handle: &mut GrpcResponseConverterHandle,
+    index: u32,
     text: &str,
 ) -> Option<(String, Vec<ToolCallDelta>)> {
-    let (tools, tool_parser) = active_tool_parser(handle)?;
+    if !tool_parsing_on(handle) {
+        return None;
+    }
     if text.is_empty() {
         return Some((String::new(), Vec::new()));
     }
-    let mut parser = tool_parser.lock().await;
+    let GrpcResponseConverterHandle {
+        tool_parsers,
+        tools,
+        model,
+        tool_choice,
+        history_tool_calls_count,
+        ..
+    } = handle;
+    let parser = tool_parsers
+        .entry(index)
+        .or_insert_with(|| tool_parser_for(model, tool_choice.as_ref()))
+        .as_mut()?;
+    let tools = tools.as_deref()?;
     match parser.parse_incremental(text, tools).await {
         Ok(result) => Some((
             result.normal_text,
             result
                 .calls
                 .into_iter()
-                .map(|item| tool_call_delta(handle, item))
+                .map(|item| tool_call_delta(model, *history_tool_calls_count, item))
                 .collect(),
         )),
         Err(error) => {
@@ -330,15 +335,15 @@ async fn tool_parser_output(
     }
 }
 
-/// What the parser still holds once the stream has ended: text that never
-/// became a call (content, as the gateway's own streaming path sends it)
-/// and arguments it parsed but did not stream. `None` when no parser reads
-/// the stream.
-async fn unstreamed_tool_output(
-    handle: &GrpcResponseConverterHandle,
+/// What a choice's parser still holds once the choice has ended: text that
+/// never became a call (content, as the gateway's own streaming path sends
+/// it) and arguments it parsed but did not stream. The parser goes with the
+/// choice. `None` when no parser read the choice.
+fn unstreamed_tool_output(
+    handle: &mut GrpcResponseConverterHandle,
+    index: u32,
 ) -> Option<(String, Vec<ToolCallDelta>)> {
-    let (_, tool_parser) = active_tool_parser(handle)?;
-    let mut parser = tool_parser.lock().await;
+    let mut parser = handle.tool_parsers.remove(&index).flatten()?;
     let text = parser.take_unstreamed_normal_text();
     let calls = parser
         .get_unstreamed_tool_args()
@@ -362,15 +367,15 @@ async fn unstreamed_tool_output(
 /// that continues the arguments carries none, as the gateway's own streaming
 /// path and the public API send it (a client keeping the latest id it sees
 /// would otherwise end up with a different one than the call's).
-fn tool_call_delta(handle: &GrpcResponseConverterHandle, item: ToolCallItem) -> ToolCallDelta {
-    let id = item.name.as_ref().map(|name| {
-        generate_tool_call_id(
-            &handle.model,
-            name,
-            item.tool_index,
-            handle.history_tool_calls_count,
-        )
-    });
+fn tool_call_delta(
+    model: &str,
+    history_tool_calls_count: usize,
+    item: ToolCallItem,
+) -> ToolCallDelta {
+    let id = item
+        .name
+        .as_ref()
+        .map(|name| generate_tool_call_id(model, name, item.tool_index, history_tool_calls_count));
     ToolCallDelta {
         index: item.tool_index as u32,
         id,
@@ -476,7 +481,7 @@ pub(crate) async fn convert_proto_chunk_to_openai(
             // carries the role with the first text (or calls) the decoder
             // released, as every delta does: a role-only delta dropped that
             // text, which the decoder had already advanced past.
-            let (content, tool_calls) = match tool_parser_output(handle, &chunk_text).await {
+            let (content, tool_calls) = match tool_parser_output(handle, index, &chunk_text).await {
                 Some(released) => released,
                 None => (chunk_text, Vec::new()),
             };
@@ -567,11 +572,11 @@ pub(crate) async fn convert_proto_chunk_to_openai(
             // then what the parser still holds: text that never became a
             // call, arguments parsed but not streamed yet.
             let (mut final_text, mut eof_tool_calls) =
-                match tool_parser_output(handle, &pending_text).await {
+                match tool_parser_output(handle, index, &pending_text).await {
                     Some(released) => released,
                     None => (pending_text, Vec::new()),
                 };
-            if let Some((held_text, held_calls)) = unstreamed_tool_output(handle).await {
+            if let Some((held_text, held_calls)) = unstreamed_tool_output(handle, index) {
                 final_text.push_str(&held_text);
                 eof_tool_calls.extend(held_calls);
             }
@@ -719,7 +724,7 @@ mod tests {
         for stop in ["NEVER", "é"] {
             let mut handle = GrpcResponseConverterHandle {
                 tokenizer: tokenizer.clone(),
-                tool_parser: None,
+                tool_parsers: HashMap::new(),
                 stop: Some(StringOrArray::Array(vec![stop.into()])),
                 stop_token_ids: None,
                 model: "byte-fallback-test".into(),
@@ -791,7 +796,7 @@ mod tests {
         for stop in [None, Some(StringOrArray::Array(vec!["NEVER".into()]))] {
             let mut handle = GrpcResponseConverterHandle {
                 tokenizer: tokenizer.clone(),
-                tool_parser: None,
+                tool_parsers: HashMap::new(),
                 stop,
                 stop_token_ids: None,
                 model: "byte-fallback-test".into(),
@@ -873,9 +878,10 @@ mod tests {
         .unwrap();
         GrpcResponseConverterHandle {
             tokenizer,
-            tool_parser: Some(Arc::new(TokioMutex::new(
-                Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>,
-            ))),
+            tool_parsers: HashMap::from([(
+                0,
+                Some(Box::new(tool_parser::JsonParser::new()) as Box<dyn ToolParser>),
+            )]),
             stop: Some(StringOrArray::Array(vec!["NEVER".into()])),
             stop_token_ids: None,
             model: "byte-fallback-test".into(),
