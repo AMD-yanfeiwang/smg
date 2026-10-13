@@ -1931,3 +1931,215 @@ async fn a_response_with_a_nul_escape_stores_under_the_sweep_index_and_the_earli
         "the sweep plans on its index: {plan:?}"
     );
 }
+
+/// A start on a database that still has the index an earlier release built
+/// drops it without blocking the table: while a transaction another session
+/// holds open on `responses` makes that start's drop wait, and a third start
+/// comes up next to it, a plain read and a plain write from another session
+/// answer (a plain `DROP INDEX` wants an ACCESS EXCLUSIVE lock on the table,
+/// and the read would queue behind it until the first session ends; a third
+/// start asking for an index the table has would wait for a share lock
+/// behind the waiting drop, and the write would queue behind that). The
+/// starts: the first prepares the database, the second's drop waits, the
+/// third comes up next to it. On a database of its own.
+#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+#[tokio::test]
+#[ignore = "requires a live Postgres database; set DATA_CONNECTOR_TEST_POSTGRES_URL and run with -- --ignored"]
+async fn a_start_drops_the_earlier_index_without_blocking_a_read_or_a_write_on_the_table() {
+    let Some(db_url) = test_db_url() else {
+        return;
+    };
+    let scratch = ScratchDatabase::create(&db_url, "drop_lock")
+        .await
+        .expect("create a scratch database");
+    let outcome = async {
+        postgres_bundle(&scratch.url)
+            .await
+            .map(drop)
+            .map_err(|e| format!("the first start: {e}"))?;
+        scratch
+            .run(
+                "CREATE INDEX responses_unstored_idx ON responses ((raw_response::jsonb->>'status')) \
+                 WHERE (raw_response::jsonb->>'store') = 'false'",
+            )
+            .await
+            .map_err(|e| format!("the earlier release's index: {e}"))?;
+
+        // Session 1: a transaction that read the table and stays open.
+        let (holder, holder_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 1: {e}"))?;
+        let mut drivers = JoinSet::new();
+        drivers.spawn(async move {
+            let _ = holder_connection.await;
+        });
+        holder
+            .batch_execute("BEGIN; SELECT count(*) FROM responses")
+            .await
+            .map_err(|e| format!("session 1's read: {e}"))?;
+
+        // Session 2: the second start, whose drop of the earlier index has
+        // to wait for session 1.
+        let url = scratch.url.clone();
+        let mut start = JoinSet::new();
+        start.spawn(async move { postgres_bundle(&url).await.map(drop) });
+
+        // Seen from a fourth session: the second start waits on a lock in
+        // its drop.
+        let (watch, watch_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 4: {e}"))?;
+        drivers.spawn(async move {
+            let _ = watch_connection.await;
+        });
+        let mut waiting_drop = None;
+        for _ in 0..200 {
+            let rows = watch
+                .query(
+                    "SELECT wait_event_type || '/' || coalesce(wait_event, '') FROM pg_stat_activity \
+                     WHERE datname = current_database() AND query ILIKE 'DROP INDEX%' \
+                     AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("session 4's read: {e}"))?;
+            if let Some(row) = rows.first() {
+                waiting_drop = Some(row.get::<_, String>(0));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A third start while the second's drop waits (replicas come up
+        // together): it must take no lock on the table either, or every write
+        // queues behind it. Both are seen waiting in a drop (the third in its
+        // own concurrent drop, not in a share-lock request for an index the
+        // table has) before the third session's statements go out.
+        let url = scratch.url.clone();
+        start.spawn(async move { postgres_bundle(&url).await.map(drop) });
+        let mut both_waiting = false;
+        for _ in 0..200 {
+            let waiting: i64 = watch
+                .query_one(
+                    "SELECT count(*) FROM pg_stat_activity \
+                     WHERE datname = current_database() AND query ILIKE 'DROP INDEX%' \
+                     AND wait_event_type = 'Lock'",
+                    &[],
+                )
+                .await
+                .map_err(|e| format!("session 4's count: {e}"))?
+                .get(0);
+            if waiting >= 2 {
+                both_waiting = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Session 3: a plain read and a plain write, bounded by the server at
+        // 2 s each.
+        let (reader, reader_connection) =
+            tokio_postgres::connect(&scratch.url, tokio_postgres::NoTls)
+                .await
+                .map_err(|e| format!("session 3: {e}"))?;
+        drivers.spawn(async move {
+            let _ = reader_connection.await;
+        });
+        reader
+            .batch_execute("SET statement_timeout = '2s'")
+            .await
+            .map_err(|e| format!("session 3's bound: {e}"))?;
+        let started = Instant::now();
+        let read = reader
+            .query_one("SELECT count(*) FROM responses", &[])
+            .await
+            .map(|row| row.get::<_, i64>(0))
+            .map_err(|e| match e.as_db_error() {
+                Some(db) => format!("{} ({})", db.message(), db.code().code()),
+                None => e.to_string(),
+            });
+        let read_took = started.elapsed();
+        let writing = Instant::now();
+        let write = reader
+            .execute("DELETE FROM responses WHERE id = 'none'", &[])
+            .await
+            .map_err(|e| match e.as_db_error() {
+                Some(db) => format!("{} ({})", db.message(), db.code().code()),
+                None => e.to_string(),
+            });
+        let write_took = writing.elapsed();
+
+        // Session 1 ends: the drops go through and the second and third
+        // starts complete.
+        holder
+            .batch_execute("COMMIT")
+            .await
+            .map_err(|e| format!("session 1's commit: {e}"))?;
+        let mut starts = Vec::new();
+        loop {
+            let joined = tokio::time::timeout(Duration::from_secs(60), start.join_next()).await;
+            match joined {
+                Err(_) => starts.push(Err("still waiting 60 s after session 1 ended".to_string())),
+                Ok(None) => break,
+                Ok(Some(Err(e))) => starts.push(Err(format!("its task: {e}"))),
+                Ok(Some(Ok(result))) => starts.push(result),
+            }
+            if starts.len() == 2 {
+                break;
+            }
+        }
+        let indexes = scratch.indexes().await?;
+        drop(holder);
+        drop(watch);
+        drop(reader);
+        drivers.join_all().await;
+        Ok::<_, String>((
+            waiting_drop,
+            both_waiting,
+            read,
+            read_took,
+            write,
+            write_took,
+            starts,
+            indexes,
+        ))
+    }
+    .await;
+    scratch.drop().await;
+
+    let (waiting_drop, both_waiting, read, read_took, write, write_took, starts, indexes) =
+        outcome.unwrap();
+    println!(
+        "the second start's drop waited on {waiting_drop:?}; a third start waited in its own drop: {both_waiting}; \
+         the read meanwhile: {read:?} after {read_took:?}; the write: {write:?} after {write_took:?}; \
+         the starts: {starts:?}; indexes after: {indexes:?}"
+    );
+    assert!(
+        waiting_drop.is_some(),
+        "the second start's drop of the earlier index did not wait for the open transaction"
+    );
+    assert!(
+        both_waiting,
+        "the third start was not seen waiting in its own drop next to the second's"
+    );
+    assert!(
+        read.is_ok(),
+        "a plain read on the table waited behind the starts (cancelled at its 2 s bound): {read:?}"
+    );
+    assert!(
+        write.is_ok(),
+        "a plain write on the table waited behind the starts (cancelled at its 2 s bound): {write:?}"
+    );
+    assert!(
+        starts.len() == 2 && starts.iter().all(|s| s.is_ok()),
+        "the second and third starts once session 1 ended: {starts:?}"
+    );
+    assert!(
+        !indexes
+            .iter()
+            .any(|index| index == "responses_unstored_idx"),
+        "the earlier index is gone after the start: {indexes:?}"
+    );
+}
