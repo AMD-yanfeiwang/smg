@@ -1088,6 +1088,7 @@ impl RouterConfigBuilder {
                 }
 
                 self.config.client_identity = Some(combined);
+                self.config.client_key_path = Some(key_path.clone());
             }
             (None, None) => {
                 // No client cert configured, that's fine
@@ -1124,6 +1125,7 @@ impl RouterConfigBuilder {
                 })?;
                 self.config.server_cert = Some(cert);
                 self.config.server_key = Some(key);
+                self.config.server_key_path = Some(key_path.clone());
             }
             (None, None) => {}
             _ => {
