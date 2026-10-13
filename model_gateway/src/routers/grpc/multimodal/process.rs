@@ -12,7 +12,7 @@ use llm_multimodal::{
     AsyncMultiModalTracker, AudioClip, EncoderDtype, EncoderFieldLayouts, ImageFrame,
     MediaItemInfo, Modality, ModelMetadata, ModelProcessorSpec, PlaceholderRange,
     PreProcessorConfig, PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput,
-    VideoClip, VisionPreProcessor, VisionProcessorRegistry,
+    TransparencyPolicy, VideoClip, VisionPreProcessor, VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
 use rayon::prelude::*;
@@ -23,6 +23,7 @@ use super::{
     log_mm_timing_enabled,
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
+    transparency::frame_transparency,
     MediaBatch, MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
     PromptBinding, RegistryTokenizer,
 };
@@ -50,6 +51,7 @@ pub(crate) async fn process_multimodal_plan(
     tokenizer_id: &str,
     tokenizer_source: &str,
     image_wire_dtype: Option<EncoderDtype>,
+    transparency: TransparencyPolicy,
 ) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -74,6 +76,14 @@ pub(crate) async fn process_multimodal_plan(
         .model_registry
         .lookup(&metadata)
         .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
+    // The frames decode under the destination engine's transparency policy,
+    // unless the processor takes the image as decoded and handles alpha itself.
+    let transparency = frame_transparency(
+        &components.vision_processor_registry,
+        model_id,
+        model_type,
+        transparency,
+    );
     let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
 
     let media_started = Instant::now();
@@ -82,7 +92,8 @@ pub(crate) async fn process_multimodal_plan(
         .with_video_frame_sampling(
             spec.video_frame_sampling()
                 .with_frame_budget(components.video_frame_budget),
-        );
+        )
+        .with_image_transparency(transparency);
 
     for part in plan.into_parts() {
         tracker
@@ -212,6 +223,7 @@ pub(crate) async fn process_multimodal_plan(
             tokenizer_id,
             &model_config,
             image_wire_dtype,
+            transparency,
         )
     }))
     .await?;
@@ -364,6 +376,7 @@ async fn preprocess_modality(
     tokenizer_id: &str,
     model_config: &MultimodalModelConfig,
     image_wire_dtype: Option<EncoderDtype>,
+    transparency: TransparencyPolicy,
 ) -> Result<PreprocessedEncoderInputs> {
     // Run CPU-intensive preprocessing on a blocking thread pool so it doesn't
     // block the tokio async runtime under concurrent load.
@@ -389,6 +402,7 @@ async fn preprocess_modality(
                     "preprocessor_config": pp_config,
                     // A one-pass result is only right for its own wire.
                     "image_wire_dtype": image_wire_dtype.map(|dtype| dtype.to_string()),
+                    "transparency": transparency,
                 });
                 config.sort_all_objects();
                 let fingerprint = config_fingerprint(tokenizer_id, &config);
