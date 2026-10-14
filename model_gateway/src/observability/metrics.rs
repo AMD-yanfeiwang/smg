@@ -617,7 +617,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_kv_event_batches_total",
-        "KV event batches by worker and disposition (applied, stale, tail_overflow, snapshot)"
+        "KV event batches by worker and disposition (applied, stale, snapshot, load_only)"
     );
     describe_counter!(
         "smg_engine_load_polls_total",
@@ -669,10 +669,6 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_kv_event_degraded_ranks",
         "KV event ranks whose index may be stale after an unreplayed gap, by worker"
-    );
-    describe_gauge!(
-        "smg_kv_event_tail_depth",
-        "Live KV event batches held while a snapshot resync is in flight, by worker"
     );
     describe_gauge!(
         "smg_log_dropped_lines",
@@ -2515,11 +2511,6 @@ impl Metrics {
     pub fn set_kv_event_degraded_ranks(worker_url: &str, count: usize) {
         gauge!("smg_kv_event_degraded_ranks", "worker" => intern_string(worker_url))
             .set(count as f64);
-    }
-
-    /// Live batches held for a worker while a snapshot resync is in flight.
-    pub fn set_kv_event_tail_depth(worker_url: &str, depth: usize) {
-        gauge!("smg_kv_event_tail_depth", "worker" => intern_string(worker_url)).set(depth as f64);
     }
 
     /// Publish the blocks the positional index holds for a worker. Called from
