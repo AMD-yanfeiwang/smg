@@ -291,6 +291,43 @@ impl ProviderProfile {
         }
     }
 
+    /// The call id of a tool result the preceding assistant turn did not
+    /// issue, when that turn issued calls at all, under the contracts that
+    /// refuse such a history (OpenAI's and DeepSeek's); `None` otherwise. The
+    /// one rule a history the gateway assembles (the Responses conversions
+    /// build one from input items and stored turns) can be held to: a tool
+    /// result with no call before it at all may be the gateway's own loader
+    /// dropping the turn's calls, not the client's fault, and is left to the
+    /// engine as before; the chat endpoint's own history gets the full
+    /// pairing rule through [`Self::validate_chat`].
+    pub fn unanswerable_tool_result(self, messages: &[ChatMessage]) -> Option<&str> {
+        if !matches!(self, ProviderProfile::OpenAi | ProviderProfile::DeepSeek) {
+            return None;
+        }
+        let mut issued: Option<Vec<&str>> = None;
+        for message in messages {
+            match message {
+                ChatMessage::Assistant { tool_calls, .. } => {
+                    let ids: Vec<&str> = tool_calls
+                        .iter()
+                        .flatten()
+                        .map(|call| call.id.as_str())
+                        .collect();
+                    issued = (!ids.is_empty()).then_some(ids);
+                }
+                ChatMessage::Tool { tool_call_id, .. } => {
+                    if let Some(ids) = &issued {
+                        if !ids.contains(&tool_call_id.as_str()) {
+                            return Some(tool_call_id.as_str());
+                        }
+                    }
+                }
+                _ => issued = None,
+            }
+        }
+        None
+    }
+
     /// Contract rules applied on top of core validation.
     pub fn validate_chat(
         self,
@@ -308,6 +345,7 @@ impl ProviderProfile {
             }
             ProviderProfile::DeepSeek => {
                 reject_root(req)?;
+                openai::validate_tool_message_pairing(&req.messages)?;
                 deepseek::validate_chat(req)
             }
             ProviderProfile::OpenAi => {
@@ -598,5 +636,92 @@ mod tests {
                 "{model}"
             );
         }
+    }
+
+    /// A tool result under a call id the previous assistant turn did not
+    /// issue is a malformed history under the DeepSeek contract, as under
+    /// OpenAI's: the chat endpoint refuses it with the public API's code, and
+    /// a history assembled elsewhere names the id. A tool result with no call
+    /// before it at all is left alone there (a loader may have dropped the
+    /// calls); the generic profile leaves every shape to the engine.
+    #[test]
+    fn a_tool_result_under_an_unknown_call_id_is_refused_under_the_deepseek_contract() {
+        let request = |model: &str, messages: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({"model": model, "messages": messages}))
+                .expect("a chat request")
+        };
+        let wrong = |model: &str| {
+            request(
+                model,
+                serde_json::json!([
+                    {"role": "user", "content": "Add 17 and 25."},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "add_integers", "arguments": "{\"a\":17,\"b\":25}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_doesnotexist", "content": "42"}
+                ]),
+            )
+        };
+        let right = request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"role": "user", "content": "Add 17 and 25."},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "add_integers", "arguments": "{\"a\":17,\"b\":25}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "42"}
+            ]),
+        );
+        let code = |request: &ChatCompletionRequest| {
+            ProviderProfile::for_model(&request.model)
+                .validate_chat(request)
+                .err()
+                .map(|error| error.code.to_string())
+        };
+        assert_eq!(
+            code(&wrong("deepseek-flash")).as_deref(),
+            Some("tool_call_id_not_found")
+        );
+        assert_eq!(code(&right), None);
+        assert_eq!(code(&wrong("local-model")), None);
+
+        let deepseek = ProviderProfile::DeepSeek;
+        assert_eq!(
+            deepseek.unanswerable_tool_result(&wrong("deepseek-flash").messages),
+            Some("call_doesnotexist")
+        );
+        assert_eq!(deepseek.unanswerable_tool_result(&right.messages), None);
+        assert_eq!(
+            ProviderProfile::Generic.unanswerable_tool_result(&wrong("local-model").messages),
+            None
+        );
+        // The shapes a gateway's own loaders produce when they drop a turn's
+        // calls: a result with no call before it, and a result that answers a
+        // stored turn ahead of a later call and its result.
+        let loaded_without_calls = request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"role": "user", "content": "Add 17 and 25."},
+                {"role": "tool", "tool_call_id": "call_a", "content": "42"}
+            ]),
+        );
+        assert_eq!(
+            deepseek.unanswerable_tool_result(&loaded_without_calls.messages),
+            None
+        );
+        let loop_turn = request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"role": "tool", "tool_call_id": "call_a", "content": "42"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_m", "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_m", "content": "ok"}
+            ]),
+        );
+        assert_eq!(deepseek.unanswerable_tool_result(&loop_turn.messages), None);
     }
 }
