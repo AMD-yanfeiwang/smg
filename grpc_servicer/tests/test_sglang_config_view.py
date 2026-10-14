@@ -91,8 +91,34 @@ def test_bare_server_args_read_as_the_defaults():
 
 @pytest.mark.parametrize("value", [None, 0, -1, True, "64"])
 def test_a_window_or_width_that_is_not_a_count_reads_as_none(value):
-    args = EngineConfigView(SimpleNamespace(max_running_requests=value, dp_size=value)).server_args
-    assert (args.max_running_requests, args.dp_size) == (None, None)
+    args = EngineConfigView(
+        SimpleNamespace(max_running_requests=value, dp_size=value, attn_dp_size=value)
+    ).server_args
+    assert (args.max_running_requests, args.dp_size, args.attn_dp_size) == (None, None, None)
+
+
+def test_the_attention_dp_width_and_the_scheduler_count_follow_either_release():
+    """The pinned release keeps ``--dp-size N --enable-dp-attention`` as given;
+    the newer releases resolve it into ``attn_dp_size=N, dp_size=1``. Both
+    spellings split the flag N ways across N schedulers; plain data
+    parallelism runs the whole flag on each of its N schedulers; a data-parallel
+    width of replicas times an attention-DP width counts both."""
+
+    def section(**args):
+        return EngineConfigView(SimpleNamespace(**args)).server_args
+
+    pinned = section(dp_size=8, enable_dp_attention=True)
+    rewritten = section(attn_dp_size=8, dp_size=1, enable_dp_attention=False)
+    replicas = section(dp_size=8, enable_dp_attention=False)
+    mixed = section(dp_size=2, attn_dp_size=4, enable_dp_attention=False)
+    single = section(attn_dp_size=1, dp_size=1, enable_dp_attention=False)
+    assert (pinned.attention_dp_width, pinned.scheduler_count) == (8, 8)
+    assert (rewritten.attention_dp_width, rewritten.scheduler_count) == (8, 8)
+    assert (replicas.attention_dp_width, replicas.scheduler_count) == (1, 8)
+    assert (mixed.attention_dp_width, mixed.scheduler_count) == (4, 8)
+    assert (single.attention_dp_width, single.scheduler_count) == (1, 1)
+    bare = section()
+    assert (bare.attn_dp_size, bare.attention_dp_width, bare.scheduler_count) == (None, 1, 1)
 
 
 def test_the_model_section_reads_the_hf_config_and_the_shape():
@@ -154,3 +180,11 @@ def test_a_section_is_read_once_per_view():
     view = EngineConfigView(Args())
     assert view.server_args.dp_size == 2 and view.server_args.dp_size == 2
     assert reads == [1]
+
+
+def test_the_attention_context_parallel_width_reads_as_a_count_or_none():
+    """The newer releases' attention context parallelism splits one attention
+    group's TP width further; the pinned release has no such attribute."""
+    assert EngineConfigView(SimpleNamespace(attn_cp_size=2)).server_args.attn_cp_size == 2
+    assert EngineConfigView(SimpleNamespace()).server_args.attn_cp_size is None
+    assert EngineConfigView(SimpleNamespace(attn_cp_size=0)).server_args.attn_cp_size is None
