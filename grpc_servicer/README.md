@@ -393,6 +393,16 @@ structural tag that lets the thought precede the JSON). A router shapes a
 forced tool call's grammar by it as the engine's own server would: the thought
 and then the calls, so the call is not forced into the thought.
 
+Both TokenSpeed servicers also report the engine's constrained-decoding policy,
+when it declares one, as `GetServerInfo.constrained_decoding` (a field of its
+own, not a `server_args` key): `always` for a model that takes a grammar on
+every turn, `requested` for one only when the request asks. The servicers read
+it as `constrained_decoding` off TokenSpeed's `ServerArgs`, else its
+`ModelConfig`. A router turns the field into the worker's `constrained_decoding`
+label and records the policy there; the request paths that act on `always` are a
+separate change, so until they land every worker is served as `requested`, which
+is what every worker did before the label existed.
+
 #### Multi-node engines: the worker pod's liveness
 
 An engine whose tensor-parallel ranks span pods is launched on every pod with
