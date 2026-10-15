@@ -628,9 +628,9 @@ fn transform_content_field(
 }
 
 /// A popped assistant message's prefill: its string content, or its text parts joined in order.
-fn prefill_text(content: &Value) -> Option<String> {
+fn prefill_text(content: Value) -> Option<String> {
     match content {
-        Value::String(text) => Some(text.clone()),
+        Value::String(text) => Some(text),
         Value::Array(parts) => Some(
             parts
                 .iter()
@@ -810,14 +810,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
             Some(&combined_template_kwargs)
         };
 
-        let continues_final_assistant = request.continue_final_message
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant");
+        let continues_final_assistant = request.continues_final_assistant();
         // Renderers that continue a trailing assistant message natively
-        // (DeepSeek-V4.1: rendered without EOS and without a generation
+        // (Jinja templates, cut right after the message as transformers
+        // does; DeepSeek-V4.1: rendered without EOS and without a generation
         // header) keep the message and are called without a generation
         // prompt; other templates get the message popped and its content
         // appended after the generation prompt as a prefix.
@@ -828,6 +824,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
 
         let params = ChatTemplateParams {
             add_generation_prompt: !native_continuation,
+            continue_final_message: native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
@@ -840,17 +837,21 @@ pub(crate) fn process_chat_messages_with_placeholders(
             // Pop the last message to render it as the prefix. A trailing
             // assistant role implies a non-empty list, so the `else` arm is
             // only defensive.
-            let Some(last_msg) = transformed_messages.pop() else {
+            let Some(mut last_msg) = transformed_messages.pop() else {
                 return Ok((
                     ProcessedMessages {
                         text: String::new(),
                         stop_sequences: request.stop.clone(),
                         unbilled_prompt_tokens: 0,
+                        continued_final_message: false,
                     },
                     PromptEncoding::FromText,
                 ));
             };
-            last_msg.get("content").and_then(prefill_text)
+            last_msg
+                .get_mut("content")
+                .map(Value::take)
+                .and_then(prefill_text)
         } else {
             None
         };
@@ -873,6 +874,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             text,
             stop_sequences: request.stop.clone(),
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
+            continued_final_message: rendered.continued_final_message,
         },
         rendered.encoding,
     ))
@@ -2300,6 +2302,39 @@ mod tests {
         let anchored = render(Some(&placeholders));
         assert!(anchored.contains("<SPECIAL_30>") && !anchored.contains("<video>"));
         assert!(render(None).contains("<video>"));
+    }
+
+    /// An assistant turn that opens with a header the generation prompt
+    /// lacks: the continued text must follow the header.
+    const HEADER_TEMPLATE: &str = r"
+{%- for m in messages -%}
+{%- if m.role == 'assistant' -%}{{- '<|turn|>assistant<|to|>user<|body|>' + m.content + '<|end|>' -}}
+{%- else -%}{{- '<|turn|>' + m.role + '<|body|>' + m.content + '<|end|>' -}}{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}{{- '<|turn|>assistant' -}}{%- endif -%}";
+
+    /// A Jinja template continues the trailing assistant message inside the
+    /// turn it renders for it, as transformers does.
+    #[test]
+    fn jinja_template_continues_inside_the_assistant_turn() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(HEADER_TEMPLATE.to_string())
+            .unwrap();
+        let (processed, _) = process_chat_messages_with_placeholders(
+            &prefill_request(),
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap();
+        assert_eq!(
+            processed.text,
+            "<|turn|>user<|body|>Hello<|end|><|turn|>assistant<|to|>user<|body|>Sure"
+        );
+        assert!(processed.continued_final_message);
     }
 
     /// Under the OpenAI content format the popped assistant message keeps its

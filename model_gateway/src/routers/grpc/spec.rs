@@ -89,7 +89,9 @@ pub(crate) struct ChatResponseSpec {
     /// The typed `thinking.type` toggle as the provider profile reads it
     /// (`ChatCompletionRequest::effective_thinking_toggle`).
     pub thinking: Option<bool>,
-    /// `continue_final_message` on a trailing assistant message.
+    /// `continue_final_message` on a trailing assistant message. Request
+    /// building replaces the request's ask with what the rendered prompt did
+    /// (`ProcessedMessages::continued_final_message`).
     pub continues_final_assistant: bool,
     /// `n`, normalized.
     pub expected_choices: u32,
@@ -133,7 +135,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
             chat_template_kwargs: request.chat_template_kwargs.clone(),
             reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
             thinking: request.effective_thinking_toggle(),
-            continues_final_assistant: utils::continues_final_assistant(request),
+            continues_final_assistant: request.continues_final_assistant(),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
             top_logprobs: request.top_logprobs,
@@ -190,6 +192,9 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
+    /// The provider profile the requested model selects; it reads the
+    /// request's thinking the way the chat spec's does.
+    pub provider: ProviderProfile,
     pub thinking: Option<messages::ThinkingConfig>,
     /// Native channel formats can derive the initial state from the rendered prompt.
     pub reasoning_in_prefill: Option<bool>,
@@ -201,11 +206,16 @@ pub(crate) struct MessagesResponseSpec {
     pub stop_sequences: Option<Vec<String>>,
     /// Symphony's assignment when a table reads the message (see `regular::symphony`).
     pub symphony: Option<Assignment>,
+    /// A trailing assistant message with text and no tool call, continued as
+    /// a prefill. Request building replaces the request's ask with what the
+    /// rendered prompt did (`ProcessedMessages::continued_final_message`).
+    pub continues_final_assistant: bool,
 }
 
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
         Self {
+            provider: ProviderProfile::for_model(&request.model),
             thinking: request.thinking.clone(),
             reasoning_in_prefill: None,
             tool_choice: request.tool_choice.clone(),
@@ -220,6 +230,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
             symphony: None,
+            continues_final_assistant: request.continues_final_assistant(),
         }
     }
 }
@@ -229,15 +240,18 @@ impl MessagesResponseSpec {
         if let Some(in_prefill) = self.reasoning_in_prefill {
             return in_prefill;
         }
-        let user_thinking = match &self.thinking {
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                | messages::ThinkingConfig::Adaptive { .. },
-            ) => Some(true),
-            Some(messages::ThinkingConfig::Disabled) => Some(false),
-            None => None,
-        };
-        utils::should_mark_reasoning_started(user_thinking, tokenizer)
+        let user_thinking = self
+            .thinking
+            .as_ref()
+            .map(messages::ThinkingConfig::enabled);
+        utils::reasoning_starts_in_prefill(
+            None,
+            None,
+            user_thinking,
+            self.continues_final_assistant,
+            tokenizer,
+            self.provider,
+        )
     }
 }
 

@@ -237,7 +237,11 @@ impl MessagePreparationStage {
         // registry decides for every other request. On a thinking prompt a
         // parser with a reasoning prefix gets its tag wrapped so a forced call
         // follows the reasoning instead of preempting it.
-        let reasoning = utils::messages_reasoning_starts_in_prefill(request, tokenizer.as_ref());
+        let reasoning = utils::messages_reasoning_starts_in_prefill(
+            request,
+            processed_messages.continued_final_message,
+            tokenizer.as_ref(),
+        );
         let names = ctx.components.parser_resolver.names(&request.model);
         let symphony_constraint = symphony::constraint_messages(
             parser,
@@ -245,7 +249,7 @@ impl MessagePreparationStage {
             request,
             &filtered_tools,
             reasoning,
-            message_utils::continues_assistant(request),
+            request.continues_final_assistant(),
             &ctx.components.templates,
         )
         .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;

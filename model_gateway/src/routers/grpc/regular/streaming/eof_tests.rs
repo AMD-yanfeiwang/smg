@@ -11,7 +11,9 @@ use futures::{stream, StreamExt as _};
 use http_body::Frame;
 use http_body_util::StreamBody;
 use llm_tokenizer::{traits::Encoding, SpecialTokens};
-use openai_protocol::{chat::ChatCompletionRequest, worker::HealthCheckConfig};
+use openai_protocol::{
+    chat::ChatCompletionRequest, profile::ProviderProfile, worker::HealthCheckConfig,
+};
 use prost::Message as ProstMessage;
 use smg_grpc_client::vllm_engine::{
     proto, proto::generate_response::Response as GenerationEvent, AbortOnDropStream,
@@ -650,6 +652,7 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
     let (stream, server) = scripted_stream(byte_fallback_eof_frames(), "0").await;
     let (tx, rx) = sse_channel();
     let spec = MessagesResponseSpec {
+        provider: ProviderProfile::Generic,
         thinking: None,
         reasoning_in_prefill: None,
         tool_choice: None,
@@ -658,6 +661,7 @@ async fn byte_fallback_messages_eof_emits_exact_text_before_block_stop() {
         chat_tools: Vec::new(),
         stop_sequences: None,
         symphony: None,
+        continues_final_assistant: false,
     };
     let result = processor(false)
         .process_messages_streaming_chunks(
@@ -745,6 +749,7 @@ fn byte_fallback_reasoning_tokenizer() -> Arc<dyn Tokenizer> {
 
 fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
     MessagesResponseSpec {
+        provider: ProviderProfile::Generic,
         thinking: thinking.then_some(messages::ThinkingConfig::Enabled {
             budget_tokens: 1024,
             display: None,
@@ -756,6 +761,7 @@ fn byte_fallback_messages_spec(thinking: bool) -> MessagesResponseSpec {
         chat_tools: Vec::new(),
         stop_sequences: None,
         symphony: None,
+        continues_final_assistant: false,
     }
 }
 
@@ -1834,6 +1840,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
         let (stream, server) = scripted_stream(responses, "0").await;
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
+            provider: ProviderProfile::Generic,
             thinking: Some(messages::ThinkingConfig::Enabled {
                 budget_tokens: 1024,
                 display: None,
@@ -1845,6 +1852,7 @@ async fn messages_eof_emits_thinking_tail_before_block_stop() {
             chat_tools: Vec::new(),
             stop_sequences: None,
             symphony: None,
+            continues_final_assistant: false,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -1921,6 +1929,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
         let (stream, server) = scripted_stream(vec![chunk(0, "Hi."), done], "0").await;
         let (tx, rx) = sse_channel();
         let spec = MessagesResponseSpec {
+            provider: ProviderProfile::Generic,
             thinking: None,
             reasoning_in_prefill: None,
             tool_choice: None,
@@ -1929,6 +1938,7 @@ async fn messages_stream_stop_reason_follows_what_the_engine_matched() {
             chat_tools: Vec::new(),
             stop_sequences: Some(vec!["###".to_string()]),
             symphony: None,
+            continues_final_assistant: false,
         };
         let result = processor(false)
             .process_messages_streaming_chunks(
@@ -2294,6 +2304,7 @@ async fn messages_blocks_and_inputs(
     texts: &[&str],
 ) -> (Vec<String>, Vec<Value>) {
     let spec = MessagesResponseSpec {
+        provider: ProviderProfile::Generic,
         thinking: Some(messages::ThinkingConfig::Enabled {
             budget_tokens: 1024,
             display: None,
@@ -2305,6 +2316,7 @@ async fn messages_blocks_and_inputs(
         chat_tools: chat_spec(true).tools.unwrap(),
         stop_sequences: None,
         symphony: None,
+        continues_final_assistant: false,
     };
     let mut frames: Vec<_> = texts.iter().map(|text| chunk(0, text)).collect();
     frames.push(complete(0, "stop"));

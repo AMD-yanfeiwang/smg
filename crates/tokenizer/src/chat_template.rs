@@ -3,7 +3,7 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{borrow::Cow, collections::HashMap, fs, io, sync::OnceLock};
+use std::{borrow::Cow, collections::HashMap, fs, io, iter, sync::OnceLock};
 
 use anyhow::{anyhow, Result};
 use chrono::{
@@ -821,6 +821,14 @@ pub struct ChatTemplateParams<'a> {
     /// must come out the same each time; `None` is the clock (see
     /// [`render_instant`]).
     pub now: Option<DateTime<FixedOffset>>,
+    /// Leave the final message open for the model to continue, as
+    /// transformers' `continue_final_message` does: the conversation is
+    /// rendered with that message and cut right after its text. Not
+    /// compatible with `add_generation_prompt`. Where the template cannot
+    /// continue the message, its text follows the generation prompt instead
+    /// (`ChatTemplateOutput::continued_final_message` says which happened),
+    /// and a message that also has `reasoning_content` is refused.
+    pub continue_final_message: bool,
 }
 
 /// JSON separator pair passed through HuggingFace's `tojson` filter.
@@ -1512,14 +1520,206 @@ fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_js
         }
     }
     let merged = serde_json::json!({"role": "system", "content": system_texts.join("\n\n")});
-    std::iter::once(merged).chain(others).collect()
+    iter::once(merged).chain(others).collect()
 }
 
+/// The marker transformers appends to the continued text before rendering;
+/// the prompt is cut where it lands.
+const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+
+/// Python's `str.isspace`, which transformers' `strip`/`rstrip` and the
+/// checkpoints' whitespace runs go by: Unicode white space plus the
+/// separators U+001C..=U+001F.
+pub(crate) fn python_isspace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// The marker for one render: transformers' own, unless the request already
+/// carries its words (in a message, a tool, a document or a template kwarg);
+/// then the words followed by one more underscore than ever follows them
+/// there. Either way only the final message carries the marker.
+fn continuation_marker(messages: &[JsonValue], params: &ChatTemplateParams) -> Cow<'static, str> {
+    let words = CONTINUE_FINAL_MESSAGE_TAG.trim_end();
+    fn longest_run(text: &str, words: &str, longest: &mut Option<usize>) {
+        for (at, _) in text.match_indices(words) {
+            let run = text[at + words.len()..]
+                .bytes()
+                .take_while(|&b| b == b'_')
+                .count();
+            *longest = Some(longest.map_or(run, |n| n.max(run)));
+        }
+    }
+    fn walk(value: &JsonValue, words: &str, longest: &mut Option<usize>) {
+        match value {
+            JsonValue::String(text) => longest_run(text, words, longest),
+            JsonValue::Array(items) => items.iter().for_each(|item| walk(item, words, longest)),
+            JsonValue::Object(fields) => fields.iter().for_each(|(key, item)| {
+                longest_run(key, words, longest);
+                walk(item, words, longest);
+            }),
+            _ => {}
+        }
+    }
+    let mut longest = None;
+    for value in messages
+        .iter()
+        .chain(params.tools.into_iter().flatten())
+        .chain(params.documents.into_iter().flatten())
+    {
+        walk(value, words, &mut longest);
+    }
+    for (key, value) in params.template_kwargs.into_iter().flatten() {
+        longest_run(key, words, &mut longest);
+        walk(value, words, &mut longest);
+    }
+    match longest {
+        Some(n) => Cow::Owned(format!("{words}{} ", "_".repeat(n + 1))),
+        None => Cow::Borrowed(CONTINUE_FINAL_MESSAGE_TAG),
+    }
+}
+
+/// The text the final message is continued from: its string content, or
+/// the text of its last part that has one.
+fn final_text(message: &JsonValue) -> Option<&str> {
+    match message.get("content")? {
+        JsonValue::Array(parts) => parts.iter().rev().find_map(|part| part.get("text")),
+        content => Some(content),
+    }?
+    .as_str()
+}
+
+/// Append `marker` to the text the final message is continued from.
+fn tag_final_message(message: &mut JsonValue, marker: &str) -> Result<()> {
+    let text = match message.get_mut("content") {
+        Some(JsonValue::Array(parts)) => parts.iter_mut().rev().find_map(|p| p.get_mut("text")),
+        content => content,
+    };
+    let Some(JsonValue::String(text)) = text else {
+        return Err(anyhow!("the final message has no text to continue"));
+    };
+    text.push_str(marker);
+    Ok(())
+}
+
+/// Cut a rendering of the tagged conversation right after the continued
+/// text: at `marker`, and also past the whitespace before it when the
+/// template trimmed the marker's trailing space. The text must end right
+/// there (whitespace aside), so the cut belongs to the final message;
+/// transformers only checks that the text appears somewhere in the prompt.
+fn cut_at_final_message(mut rendered: String, text: &str, marker: &str) -> Result<String> {
+    let tag_at = rendered
+        .rfind(marker.trim_end())
+        .filter(|&at| {
+            rendered[..at]
+                .trim_end_matches(python_isspace)
+                .ends_with(text.trim_matches(python_isspace))
+        })
+        .ok_or_else(|| anyhow!("the final message does not appear in the rendered chat"))?;
+    let cut = if rendered[tag_at..].starts_with(marker) {
+        tag_at
+    } else {
+        rendered[..tag_at].trim_end_matches(python_isspace).len()
+    };
+    rendered.truncate(cut);
+    Ok(rendered)
+}
+
+/// Render with the final message left open, following transformers'
+/// `continue_final_message`: mark the end of the message's text, render the
+/// whole conversation without a generation prompt, and cut at the marker.
+///
+/// Where transformers raises instead (no text to continue, the template
+/// fails on the message, or the text never reaches the prompt, as with a
+/// template that renders no assistant turns), or would cut anywhere but
+/// right after the final message's text, the message is left out and
+/// its text appended after the generation prompt, which is how every
+/// continued message rendered before. Speech-recognition prompts rely on
+/// this: their forced-language prefill follows a generation prompt the
+/// template opens but whose turn it never renders. Only the text survives
+/// that, so a message that also has `reasoning_content` is refused there
+/// instead. The flag says which happened: true when the message was
+/// continued.
+fn render_continuing_final_message(
+    env: &Environment<'_>,
+    messages: &[JsonValue],
+    params: ChatTemplateParams,
+) -> Result<(String, bool)> {
+    if params.add_generation_prompt {
+        return Err(anyhow!(
+            "continue_final_message and add_generation_prompt are not compatible"
+        ));
+    }
+    let Some((last, head)) = messages.split_last() else {
+        return Err(anyhow!("no final message to continue"));
+    };
+    let marker = continuation_marker(messages, &params);
+    let continued = (|| {
+        let text =
+            final_text(last).ok_or_else(|| anyhow!("the final message has no text to continue"))?;
+        let mut tagged = last.clone();
+        tag_final_message(&mut tagged, &marker)?;
+        let params = ChatTemplateParams {
+            continue_final_message: false,
+            ..params
+        };
+        let (rendered, _) = render_messages(env, head.iter().chain(iter::once(&tagged)), params)?;
+        cut_at_final_message(rendered, text, &marker)
+    })();
+    let reason = match continued {
+        Ok(prompt) => return Ok((prompt, true)),
+        Err(reason) => reason,
+    };
+    if last
+        .get("reasoning_content")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|reasoning| !reasoning.is_empty())
+    {
+        return Err(anyhow!(
+            "{reason}: only its text could follow the generation prompt, and its \
+             reasoning_content would be lost"
+        ));
+    }
+    tracing::debug!(%reason, "appending the continued message after the generation prompt");
+    let (mut prompt, _) = render_chat_template(
+        env,
+        head,
+        ChatTemplateParams {
+            add_generation_prompt: true,
+            continue_final_message: false,
+            ..params
+        },
+    )?;
+    match last.get("content") {
+        Some(JsonValue::String(text)) => prompt.push_str(text),
+        Some(JsonValue::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text")?.as_str())
+            .for_each(|text| prompt.push_str(text)),
+        _ => {}
+    }
+    Ok((prompt, false))
+}
+
+/// Render the chat, and say whether the prompt continues the final message
+/// (see [`render_continuing_final_message`]).
 fn render_chat_template(
     env: &Environment<'_>,
     messages: &[serde_json::Value],
     params: ChatTemplateParams,
-) -> Result<String> {
+) -> Result<(String, bool)> {
+    if params.continue_final_message {
+        return render_continuing_final_message(env, messages, params);
+    }
+    render_messages(env, messages.iter(), params)
+}
+
+/// Render `messages` through the template with the generation prompt the
+/// params ask for; the flag says the prompt does not continue a message.
+fn render_messages<'a>(
+    env: &Environment<'_>,
+    messages: impl Iterator<Item = &'a JsonValue>,
+    params: ChatTemplateParams,
+) -> Result<(String, bool)> {
     let tmpl = env
         .get_template("chat")
         .map_err(|e| anyhow!("Failed to get template: {e}"))?;
@@ -1530,7 +1730,7 @@ fn render_chat_template(
     let strftime_now = Value::from_function(move |format: String| strftime(&now, &format));
 
     // Convert messages to minijinja::Value (messages already processed by router)
-    let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
+    let minijinja_messages: Vec<Value> = messages.map(Value::from_serialize).collect();
 
     // transformers renders with `tools=None` and `documents=None` when the
     // request carries none: the names are defined and hold none. A template
@@ -1583,7 +1783,7 @@ fn render_chat_template(
         .render(&ctx)
         .map_err(|e| anyhow!("Failed to render template: {e}"))?;
 
-    Ok(rendered)
+    Ok((rendered, false))
 }
 
 /// The messages with every string `content` of a non-tool message replaced by
@@ -1639,7 +1839,7 @@ impl ChatTemplateProcessor {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        render_chat_template(&self.env, messages, params)
+        render_chat_template(&self.env, messages, params).map(|(prompt, _)| prompt)
     }
 }
 
@@ -1782,6 +1982,20 @@ impl ChatTemplateState {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
+        self.apply_with_continuation(messages, params)
+            .map(|(prompt, _)| prompt)
+    }
+
+    /// [`Self::apply`], also saying whether the prompt continues the final
+    /// message: false unless `continue_final_message` was asked for and the
+    /// template could continue the message instead of appending its text
+    /// after the generation prompt (see
+    /// [`ChatTemplateParams::continue_final_message`]).
+    pub fn apply_with_continuation(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
         let env = self.env.as_ref().ok_or_else(|| {
             anyhow!(
                 "Cannot use chat template functions because tokenizer.chat_template is not set \
