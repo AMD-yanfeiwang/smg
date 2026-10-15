@@ -241,6 +241,10 @@ impl ResponseProcessor {
             }
         }
 
+        if original_request.first_tool_call_only {
+            utils::keep_first_tool_call(&mut tool_calls);
+        }
+
         // Step 3: Determine finish reason. A local stop-decoder match takes
         // precedence over the engine's reason (which is "length" when stop
         // strings are enforced gateway-side rather than by the backend).
@@ -339,7 +343,8 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(ChatChoice, u32), String> {
         let tools = original_request.tools.as_deref().unwrap_or(&[]);
-        let mut reader = Reader::new(assignment, tools)?;
+        let mut reader =
+            Reader::new(assignment, tools)?.first_call_only(original_request.first_tool_call_only);
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
         // Complete token decoding, including bytes and a partial stop match, as
         // on the older path; the text it releases is the last token's.
@@ -410,7 +415,8 @@ impl ResponseProcessor {
         request: &MessagesResponseSpec,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, String> {
-        let mut reader = Reader::new(assignment, &request.chat_tools)?;
+        let mut reader = Reader::new(assignment, &request.chat_tools)?
+            .first_call_only(request.first_tool_call_only);
         stop_decoder.reset();
         let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
         let tail = stop_decoder
@@ -1003,6 +1009,10 @@ impl ResponseProcessor {
                     )
                     .await;
             }
+        }
+
+        if messages_request.first_tool_call_only {
+            utils::keep_first_tool_call(&mut tool_calls);
         }
 
         // Step 3: Build content blocks
@@ -1798,6 +1808,63 @@ plan<|tool_call>call:get_weather{city:<|"|>Paris<|"|>}<tool_call|>"#;
                 .unwrap(),
                 serde_json::json!({"city":"Paris"})
             );
+        }
+    }
+
+    /// `parallel_tool_calls: false` returns the first of the calls a model
+    /// writes; unset or true, all of them.
+    #[tokio::test]
+    async fn parallel_tool_calls_false_returns_the_first_call() {
+        let call = |q: u32| {
+            format!(
+                "<tool_call>\n{{\"name\":\"user_tool\",\"arguments\":{{\"q\":{q}}}}}\n</tool_call>"
+            )
+        };
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
+            &format!("{}\n{}", call(1), call(2)),
+        ));
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        for (parallel, calls) in [(None, 2), (Some(true), 2), (Some(false), 1)] {
+            let request: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+                "model":"test-model","messages":[{"role":"user","content":"call the tool"}],
+                "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object","properties":{"q":{"type":"integer"}}}}}],
+                "parallel_tool_calls": parallel
+            })).unwrap();
+            let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+                output_ids: vec![100],
+                finish_reason: "stop".into(),
+                ..Default::default()
+            });
+            let mut decoder = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                llm_tokenizer::StopSequenceConfig::default(),
+                false,
+            );
+            let (choice, _) = processor
+                .process_single_choice(
+                    "test-request",
+                    &complete,
+                    0,
+                    &ChatResponseSpec::from(&request),
+                    "test-model",
+                    &tokenizer,
+                    &mut decoder,
+                    0,
+                    false,
+                    true,
+                    None,
+                    Some("qwen"),
+                )
+                .await
+                .unwrap();
+            let got = choice.message.tool_calls.unwrap();
+            assert_eq!(got.len(), calls, "{parallel:?}");
+            assert_eq!(got[0].function.arguments.as_deref(), Some("{\"q\":1}"));
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
         }
     }
 }
