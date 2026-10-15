@@ -842,7 +842,6 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 return Ok((
                     ProcessedMessages {
                         text: String::new(),
-                        stop_sequences: request.stop.clone(),
                         unbilled_prompt_tokens: 0,
                         continued_final_message: false,
                     },
@@ -873,7 +872,6 @@ pub(crate) fn process_chat_messages_with_placeholders(
     Ok((
         ProcessedMessages {
             text,
-            stop_sequences: request.stop.clone(),
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
         },
@@ -1027,22 +1025,6 @@ pub(crate) fn parse_json_schema_response(
         }
         _ => (None, processed_text.to_string()),
     }
-}
-
-/// Count the number of tool calls in the request message history
-/// This is used for KimiK2 format which needs globally unique indices
-pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter_map(|msg| {
-            if let ChatMessage::Assistant { tool_calls, .. } = msg {
-                tool_calls.as_ref().map(|calls| calls.len())
-            } else {
-                None
-            }
-        })
-        .sum()
 }
 
 /// Generate a tool call ID based on model format

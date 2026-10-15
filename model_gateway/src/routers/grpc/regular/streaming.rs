@@ -471,10 +471,9 @@ impl StreamingProcessor {
                 reasoning_parser_available || original_request.symphony.is_some();
         }
 
-        // If the template supports a thinking toggle and the user enabled it,
-        // the template injected `<think>` in the prefill — parsers should start
-        // in reasoning mode.
-        let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
+        // Request building decided whether the rendered prompt ends inside the
+        // model's thinking block; the parsers then start in reasoning mode.
+        let thinking_override = original_request.reasoning_in_prefill;
         let think_in_prefill = tokenizer.think_in_prefill();
 
         // Check if JSON schema constraint was used (specific function or required mode)
@@ -485,12 +484,7 @@ impl StreamingProcessor {
         let used_json_schema = if native_tool_format {
             false
         } else {
-            match tool_choice {
-                Some(ToolChoice::Function { .. }) => true,
-                Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-                Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-                _ => false,
-            }
+            tool_choice.as_ref().is_some_and(ToolChoice::forces_call)
         };
 
         // Check if this is the specific function case (LLM generates parameters only, no name field).
@@ -2400,7 +2394,7 @@ impl StreamingProcessor {
     pub async fn process_messages_streaming_response(
         self: Arc<Self>,
         execution_result: context::ExecutionResult,
-        messages_request: MessagesResponseSpec,
+        mut messages_request: MessagesResponseSpec,
         dispatch: context::DispatchMetadata,
         tokenizer: Arc<dyn Tokenizer>,
         skip_special_tokens: bool,
@@ -2408,11 +2402,10 @@ impl StreamingProcessor {
         source: utils::StreamSource,
     ) -> Response {
         let source = source.with_backend(self.backend_type);
+        // The stream's decoder takes the spec's stop sequences; nothing reads
+        // them from the spec after this.
         let stop_params = (
-            messages_request
-                .stop_sequences
-                .clone()
-                .map(StringOrArray::Array),
+            messages_request.stop_sequences.take(),
             None::<Vec<u32>>, // No stop_token_ids in Messages API
             skip_special_tokens,
             false, // no_stop_trim
@@ -2599,14 +2592,8 @@ impl StreamingProcessor {
             reasoning_parser_name.as_deref(),
             model,
         );
-        let separate_reasoning = reasoning_requires_special_tokens
-            || matches!(
-                &original_request.thinking,
-                Some(
-                    messages::ThinkingConfig::Enabled { .. }
-                        | messages::ThinkingConfig::Adaptive { .. }
-                )
-            );
+        let separate_reasoning =
+            reasoning_requires_special_tokens || original_request.thinking_requested;
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
@@ -2614,7 +2601,7 @@ impl StreamingProcessor {
                 model,
             );
 
-        let thinking_override = original_request.reasoning_starts_in_prefill(tokenizer.as_ref());
+        let thinking_override = original_request.reasoning_in_prefill;
         let think_in_prefill = tokenizer.think_in_prefill();
 
         let tool_choice_enabled = !matches!(
@@ -2698,13 +2685,7 @@ impl StreamingProcessor {
         };
         // Thinking tokens of the turn: the engine's count when it keeps one,
         // else the tokens the parser routed to thinking, chunk by chunk.
-        let thinking_requested = matches!(
-            &original_request.thinking,
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                    | messages::ThinkingConfig::Adaptive { .. }
-            )
-        );
+        let thinking_requested = original_request.thinking_requested;
         let mut parsed_thinking_tokens: u32 = 0;
         let mut engine_thinking_tokens: u32 = 0;
         let mut was_in_reasoning = false;
@@ -4383,12 +4364,10 @@ fn opening_choice(index: u32, opens_tool_call: bool) -> OpeningChoice {
 /// call), so the stream's first delta is a tool call's, not text's.
 fn forces_tool_call(spec: &ChatResponseSpec) -> bool {
     spec.tools.as_ref().is_some_and(|tools| !tools.is_empty())
-        && match &spec.tool_choice {
-            Some(ToolChoice::Function { .. }) => true,
-            Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-            Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-            _ => false,
-        }
+        && spec
+            .tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::forces_call)
 }
 
 /// A streamed choice carrying whichever of `content`, `reasoning_content` and

@@ -5,7 +5,7 @@
 //! instead of `ChatCompletionRequest` / `ChatMessage`.
 #![allow(dead_code)] // wired in follow-up PR (pipeline factory)
 
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, fmt::Display, sync::Arc};
 
 use axum::response::Response;
 use llm_multimodal::{MediaPartOrder, Modality};
@@ -14,7 +14,7 @@ use llm_tokenizer::{
     traits::{PromptEncoding, RendererCapabilities, Tokenizer},
 };
 use openai_protocol::{
-    common::{self, StringOrArray, Tool as ChatTool, ToolChoice as ChatToolChoice},
+    common::{Tool as ChatTool, ToolChoice as ChatToolChoice},
     messages::{
         self, CountMessageTokensRequest, CreateMessageRequest, InputContent, InputContentBlock,
         InputMessage, SystemContent, ToolResultContent,
@@ -49,7 +49,6 @@ pub(crate) struct MessagesPrompt<'a> {
     pub thinking: Option<bool>,
     /// `output_config.effort`, rendered as the `reasoning_effort` kwarg.
     pub reasoning_effort: Option<&'a str>,
-    pub stop_sequences: Option<&'a [String]>,
     /// The request's tool choice, told to the template as the chat path
     /// tells it; a renderer that declares the tools under `none` writes its
     /// instruction not to call them from it.
@@ -63,7 +62,6 @@ impl<'a> From<&'a CreateMessageRequest> for MessagesPrompt<'a> {
             system: request.system.as_ref(),
             thinking: request.template_thinking(),
             reasoning_effort: request.reasoning_effort(),
-            stop_sequences: request.stop_sequences.as_deref(),
             tool_choice: request.tool_choice.as_ref(),
         }
     }
@@ -76,7 +74,6 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
             system: request.system.as_ref(),
             thinking: request.template_thinking(),
             reasoning_effort: request.reasoning_effort(),
-            stop_sequences: None,
             tool_choice: request.tool_choice.as_ref(),
         }
     }
@@ -184,10 +181,7 @@ pub(crate) fn process_messages_prompt(
     // path's `reasoning_effort` kwarg as well.
     let mut kwargs = HashMap::with_capacity(2);
     if let Some(tool_choice) = request.tool_choice {
-        chat_utils::insert_tool_choice_kwarg(
-            &mut kwargs,
-            &convert_message_tool_choice(tool_choice),
-        );
+        chat_utils::insert_tool_choice_kwarg(&mut kwargs, &ChatToolChoice::from(tool_choice));
     }
     if let Some(effort) = request.reasoning_effort {
         kwargs.insert(
@@ -238,15 +232,10 @@ pub(crate) fn process_messages_prompt(
         .map_err(|e| format!("Failed to apply chat template: {e}"))?;
 
     // Step 7: Build ProcessedMessages
-    let stop_sequences = request
-        .stop_sequences
-        .map(|seqs| StringOrArray::Array(seqs.to_vec()));
-
     let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);
     Ok((
         ProcessedMessages {
             text,
-            stop_sequences,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
         },
@@ -254,31 +243,29 @@ pub(crate) fn process_messages_prompt(
     ))
 }
 
-/// The tools the template renders for a request: the custom tools as chat
-/// tools, narrowed by `tool_choice` the way the chat path narrows them (a
-/// forced tool renders alone, and `none` renders none unless the renderer
-/// declares the tools under `none` itself, see
-/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]). Shared
-/// by the preparation stage and count_tokens so both render the same prompt.
-pub fn template_tools(
-    tools: Option<&[messages::Tool]>,
+/// The tools the template renders for a request: `chat_tools` (the custom
+/// tools as chat tools) narrowed by `tool_choice` the way the chat path
+/// narrows them (a forced tool renders alone, and `none` renders none unless
+/// the renderer declares the tools under `none` itself, see
+/// [`RendererCapabilities::declares_tools_under_tool_choice_none`]); borrowed
+/// when the choice does not narrow. Shared by the preparation stage and
+/// count_tokens so both render the same prompt.
+pub fn template_tools<'a>(
+    chat_tools: &'a [ChatTool],
     tool_choice: Option<&messages::ToolChoice>,
     capabilities: RendererCapabilities,
-) -> Vec<ChatTool> {
-    let Some(tools) = tools else {
-        return Vec::new();
-    };
+) -> Cow<'a, [ChatTool]> {
     if matches!(tool_choice, Some(messages::ToolChoice::None))
         && !capabilities.declares_tools_under_tool_choice_none
     {
-        return Vec::new();
+        return Cow::Borrowed(&[]);
     }
-    let chat_tools = extract_chat_tools(tools);
-    match tool_choice.map(convert_message_tool_choice) {
-        Some(tc) => {
-            chat_utils::filter_tools_by_tool_choice(&chat_tools, Some(&tc)).unwrap_or(chat_tools)
-        }
-        None => chat_tools,
+    match tool_choice
+        .map(ChatToolChoice::from)
+        .and_then(|choice| choice.narrow_tools(chat_tools))
+    {
+        Some(narrowed) => Cow::Owned(narrowed),
+        None => Cow::Borrowed(chat_tools),
     }
 }
 
@@ -800,111 +787,6 @@ fn order_media_parts(parts: Vec<Value>, media_order: MediaPartOrder) -> Vec<Valu
 // Type adapters: Messages API → Chat API types
 // ============================================================================
 
-/// Convert a Messages API CustomTool to a Chat API Tool.
-///
-/// Maps `CustomTool { name, description, input_schema }` to
-/// `ChatTool { type: "function", function: Function { name, description, parameters } }`
-pub(crate) fn custom_tool_to_chat_tool(tool: &messages::CustomTool) -> ChatTool {
-    // Convert InputSchema to a JSON Value for Function.parameters
-    let parameters = input_schema_to_value(&tool.input_schema);
-
-    ChatTool {
-        tool_type: "function".to_string(),
-        function: common::Function {
-            name: tool.name.clone(),
-            description: tool.description.clone(),
-            parameters,
-            strict: None,
-            extra: Default::default(),
-        },
-    }
-}
-
-/// Convert InputSchema struct to a serde_json::Value.
-fn input_schema_to_value(schema: &messages::InputSchema) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert(
-        "type".to_string(),
-        Value::String(schema.schema_type.clone()),
-    );
-
-    if let Some(properties) = &schema.properties {
-        let props: serde_json::Map<String, Value> = properties
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        obj.insert("properties".to_string(), Value::Object(props));
-    }
-
-    if let Some(required) = &schema.required {
-        obj.insert(
-            "required".to_string(),
-            Value::Array(required.iter().map(|s| Value::String(s.clone())).collect()),
-        );
-    }
-
-    // Include any additional schema fields
-    for (key, value) in &schema.additional {
-        obj.insert(key.clone(), value.clone());
-    }
-
-    Value::Object(obj)
-}
-
-/// Convert a Messages API ToolChoice to a Chat API ToolChoice.
-///
-/// Mapping:
-/// - `Auto { .. }`    → `Value(Auto)`
-/// - `Any { .. }`     → `Value(Required)`
-/// - `Tool { name }`  → `Function { name }`
-/// - `None`           → `Value(None)`
-pub(crate) fn convert_message_tool_choice(tc: &messages::ToolChoice) -> ChatToolChoice {
-    match tc {
-        messages::ToolChoice::Auto { .. } => ChatToolChoice::Value(common::ToolChoiceValue::Auto),
-        messages::ToolChoice::Any { .. } => {
-            ChatToolChoice::Value(common::ToolChoiceValue::Required)
-        }
-        messages::ToolChoice::Tool { name, .. } => ChatToolChoice::Function {
-            tool_type: "function".to_string(),
-            function: common::FunctionChoice { name: name.clone() },
-        },
-        messages::ToolChoice::None => ChatToolChoice::Value(common::ToolChoiceValue::None),
-    }
-}
-
-/// Extract Custom tools from Messages API tool list and convert to ChatTool.
-///
-/// Only `Tool::Custom` is supported in gRPC mode. Other tool types
-/// (McpToolset, Bash, TextEditor, WebSearch, ToolSearch) are ignored
-/// since they require runtime capabilities not available in the gRPC pipeline.
-pub(crate) fn extract_chat_tools(tools: &[messages::Tool]) -> Vec<ChatTool> {
-    tools
-        .iter()
-        .filter_map(|t| match t {
-            messages::Tool::Custom(custom) => Some(custom_tool_to_chat_tool(custom)),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Count the number of tool use blocks in assistant messages of the request history.
-///
-/// Parallel to `get_history_tool_calls_count` in chat_utils, but works with
-/// Messages API `InputMessage` types. Used for generating globally unique
-/// tool call IDs (e.g. KimiK2 format).
-pub(crate) fn get_history_tool_calls_count_messages(request: &CreateMessageRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter(|msg| msg.role == messages::Role::Assistant)
-        .flat_map(|msg| match &msg.content {
-            InputContent::Blocks(blocks) => blocks.as_slice(),
-            InputContent::String(_) => &[],
-        })
-        .filter(|b| matches!(b, InputContentBlock::ToolUse(_)))
-        .count()
-}
-
 /// Anthropic-native id for a `tool_use` content block.
 ///
 /// The Messages surface should expose `toolu_`-prefixed ids — strict Anthropic
@@ -1193,63 +1075,6 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_choice_conversion() {
-        assert!(matches!(
-            convert_message_tool_choice(&messages::ToolChoice::Auto {
-                disable_parallel_tool_use: None
-            }),
-            ChatToolChoice::Value(common::ToolChoiceValue::Auto)
-        ));
-        assert!(matches!(
-            convert_message_tool_choice(&messages::ToolChoice::Any {
-                disable_parallel_tool_use: None
-            }),
-            ChatToolChoice::Value(common::ToolChoiceValue::Required)
-        ));
-        assert!(matches!(
-            convert_message_tool_choice(&messages::ToolChoice::None),
-            ChatToolChoice::Value(common::ToolChoiceValue::None)
-        ));
-
-        let tc = convert_message_tool_choice(&messages::ToolChoice::Tool {
-            name: "calc".to_string(),
-            disable_parallel_tool_use: None,
-        });
-        assert!(matches!(tc, ChatToolChoice::Function { .. }));
-    }
-
-    #[test]
-    fn test_custom_tool_conversion() {
-        let custom = messages::CustomTool {
-            name: "weather".to_string(),
-            tool_type: None,
-            description: Some("Get weather".to_string()),
-            input_schema: messages::InputSchema {
-                schema_type: "object".to_string(),
-                properties: Some(
-                    [("city".to_string(), json!({"type": "string"}))]
-                        .into_iter()
-                        .collect(),
-                ),
-                required: Some(vec!["city".to_string()]),
-                additional: Default::default(),
-            },
-            defer_loading: None,
-            cache_control: None,
-            extra: Default::default(),
-        };
-
-        let chat_tool = custom_tool_to_chat_tool(&custom);
-        assert_eq!(chat_tool.function.name, "weather");
-        assert_eq!(
-            chat_tool.function.description,
-            Some("Get weather".to_string())
-        );
-        assert_eq!(chat_tool.function.parameters["type"], "object");
-        assert!(chat_tool.function.parameters["properties"]["city"].is_object());
-    }
-
-    #[test]
     fn tool_schemas_render_in_the_clients_order() {
         use llm_tokenizer::chat_template::ChatTemplateProcessor;
 
@@ -1277,7 +1102,8 @@ mod tests {
         // The tools of a fresh request, rendered as `process_messages` does.
         let render = || {
             let request: CreateMessageRequest = serde_json::from_value(body.clone()).unwrap();
-            let tools: Vec<Value> = extract_chat_tools(request.tools.as_deref().unwrap())
+            let tools: Vec<Value> = request
+                .chat_tools()
                 .iter()
                 .map(|tool| serde_json::to_value(tool).unwrap())
                 .collect();
@@ -1305,87 +1131,6 @@ mod tests {
             keys,
             ["type", "properties", "required", "additionalProperties"]
         );
-    }
-
-    #[test]
-    fn test_get_history_tool_calls_count_messages() {
-        // No tool calls
-        let request = CreateMessageRequest {
-            output_config: None,
-            model: "test".to_string(),
-            messages: vec![InputMessage {
-                role: Role::User,
-                content: InputContent::String("Hello".to_string()),
-            }],
-            max_tokens: 100,
-            metadata: None,
-            service_tier: None,
-            stop_sequences: None,
-            stream: None,
-            system: None,
-            temperature: None,
-            thinking: None,
-            tool_choice: None,
-            tools: None,
-            top_k: None,
-            top_p: None,
-            container: None,
-            mcp_servers: None,
-            rid: None,
-            other: serde_json::Map::new(),
-        };
-        assert_eq!(get_history_tool_calls_count_messages(&request), 0);
-
-        // With tool calls in assistant message
-        let request = CreateMessageRequest {
-            output_config: None,
-            model: "test".to_string(),
-            messages: vec![
-                InputMessage {
-                    role: Role::User,
-                    content: InputContent::String("Hello".to_string()),
-                },
-                InputMessage {
-                    role: Role::Assistant,
-                    content: InputContent::Blocks(vec![
-                        InputContentBlock::Text(TextBlock {
-                            text: "Let me check.".to_string(),
-                            cache_control: None,
-                            citations: None,
-                        }),
-                        InputContentBlock::ToolUse(messages::ToolUseBlock {
-                            id: "tu_1".to_string(),
-                            name: "calc".to_string(),
-                            input: json!({"x": 1}),
-                            cache_control: None,
-                        }),
-                        InputContentBlock::ToolUse(messages::ToolUseBlock {
-                            id: "tu_2".to_string(),
-                            name: "search".to_string(),
-                            input: json!({"q": "test"}),
-                            cache_control: None,
-                        }),
-                    ]),
-                },
-            ],
-            max_tokens: 100,
-            metadata: None,
-            service_tier: None,
-            stop_sequences: None,
-            stream: None,
-            system: None,
-            temperature: None,
-            thinking: None,
-            tool_choice: None,
-            tools: None,
-            top_k: None,
-            top_p: None,
-            container: None,
-            mcp_servers: None,
-            rid: None,
-            other: serde_json::Map::new(),
-        };
-        assert_eq!(get_history_tool_calls_count_messages(&request), 2);
     }
 
     #[test]
@@ -1632,8 +1377,9 @@ mod tests {
             "messages": [{"role": "user", "content": "Weather in Paris?"}]
         }))
         .unwrap();
+        let chat_tools = request.chat_tools();
         let tools = template_tools(
-            request.tools.as_deref(),
+            &chat_tools,
             request.tool_choice.as_ref(),
             RendererCapabilities::default(),
         );
@@ -1674,15 +1420,15 @@ mod tests {
             ..RendererCapabilities::default()
         };
         let none = request(json!({"type": "none"}));
-        assert!(template_tools(none.tools.as_deref(), none.tool_choice.as_ref(), plain).is_empty());
+        assert!(template_tools(&none.chat_tools(), none.tool_choice.as_ref(), plain).is_empty());
         assert_eq!(
-            template_tools(none.tools.as_deref(), none.tool_choice.as_ref(), declaring).len(),
+            template_tools(&none.chat_tools(), none.tool_choice.as_ref(), declaring).len(),
             1,
             "the renderer that declares the tools under none gets them"
         );
         let auto = request(json!({"type": "auto"}));
         assert_eq!(
-            template_tools(auto.tools.as_deref(), auto.tool_choice.as_ref(), plain).len(),
+            template_tools(&auto.chat_tools(), auto.tool_choice.as_ref(), plain).len(),
             1
         );
     }
@@ -1709,15 +1455,16 @@ mod tests {
                 body["tool_choice"] = tool_choice;
             }
             let request: CreateMessageRequest = serde_json::from_value(body).unwrap();
+            let chat_tools = request.chat_tools();
             let tools = template_tools(
-                request.tools.as_deref(),
+                &chat_tools,
                 request.tool_choice.as_ref(),
                 tok.renderer_capabilities(),
             );
             let tools_for_template = if tools.is_empty() {
                 None
             } else {
-                Some(tools.as_slice())
+                Some(&*tools)
             };
             let (processed, _) =
                 process_messages_with_encoding(&request, &tok, tools_for_template).unwrap();
@@ -1792,15 +1539,16 @@ mod tests {
             "messages": [{"role": "user", "content": "What is the weather in Paris?"}]
         }))
         .expect("the request");
+        let chat_tools = request.chat_tools();
         let tools = template_tools(
-            request.tools.as_deref(),
+            &chat_tools,
             request.tool_choice.as_ref(),
             tok.renderer_capabilities(),
         );
         let (processed, _) = process_messages(
             &request,
             tok.as_ref(),
-            Some(tools.as_slice()),
+            Some(&*tools),
             None,
             MediaPartOrder::MediaFirst,
         )
@@ -2131,9 +1879,8 @@ mod tests {
     /// block, "none" turns a toggle template's thinking off, as for Chat.
     #[test]
     fn output_config_effort_arms_the_reasoning_parser_as_rendered() {
-        use crate::routers::grpc::{
-            spec::MessagesResponseSpec,
-            utils::{chat_reasoning_starts_in_prefill, messages_reasoning_starts_in_prefill},
+        use crate::routers::grpc::utils::{
+            chat_reasoning_starts_in_prefill, messages_reasoning_starts_in_prefill,
         };
         let mut tokenizer =
             llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
@@ -2166,12 +1913,6 @@ mod tests {
                 messages_reasoning_starts_in_prefill(&request, false, &tokenizer),
                 armed,
                 "{effort}"
-            );
-            // The response processors arm from the request's spec.
-            assert_eq!(
-                MessagesResponseSpec::from(&request).reasoning_starts_in_prefill(&tokenizer),
-                armed,
-                "spec {effort}"
             );
             let chat: openai_protocol::chat::ChatCompletionRequest =
                 serde_json::from_value(json!({

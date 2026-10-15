@@ -165,9 +165,10 @@ impl ResponseProcessor {
                 reasoning_parser_name,
                 model,
             ) {
-                // If the template injected `<think>` in the prefill (thinking toggle
-                // is supported and effectively ON), start in reasoning mode.
-                if original_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
+                // Request building decided whether the rendered prompt ends
+                // inside the model's thinking block; the parser then starts in
+                // reasoning mode.
+                if original_request.reasoning_in_prefill {
                     parser.mark_reasoning_started();
                 }
 
@@ -213,12 +214,10 @@ impl ResponseProcessor {
             let used_json_schema = if native_tool_format {
                 false
             } else {
-                match &original_request.tool_choice {
-                    Some(ToolChoice::Function { .. }) => true,
-                    Some(ToolChoice::Value(ToolChoiceValue::Required)) => true,
-                    Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-                    _ => false,
-                }
+                original_request
+                    .tool_choice
+                    .as_ref()
+                    .is_some_and(ToolChoice::forces_call)
             };
 
             if used_json_schema {
@@ -448,13 +447,7 @@ impl ResponseProcessor {
         };
         let stop_sequence = stop_sequence
             .filter(|_| matches!(stop_reason, Some(messages::StopReason::StopSequence)));
-        let thinking_requested = matches!(
-            &request.thinking,
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                    | messages::ThinkingConfig::Adaptive { .. }
-            )
-        );
+        let thinking_requested = request.thinking_requested;
         let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
         Ok(Message {
             id: dispatch.request_id.clone(),
@@ -837,14 +830,8 @@ impl ResponseProcessor {
             reasoning_parser_name.as_deref(),
             model,
         );
-        let separate_reasoning = reasoning_requires_special_tokens
-            || matches!(
-                &messages_request.thinking,
-                Some(
-                    messages::ThinkingConfig::Enabled { .. }
-                        | messages::ThinkingConfig::Adaptive { .. }
-                )
-            );
+        let separate_reasoning =
+            reasoning_requires_special_tokens || messages_request.thinking_requested;
         let reasoning_parser_available = separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
@@ -946,7 +933,7 @@ impl ResponseProcessor {
                 reasoning_parser_name.as_deref(),
                 model,
             ) {
-                if messages_request.reasoning_starts_in_prefill(tokenizer.as_ref()) {
+                if messages_request.reasoning_in_prefill {
                     parser.mark_reasoning_started();
                 }
 
@@ -987,10 +974,7 @@ impl ResponseProcessor {
 
             if used_json_schema {
                 // Bridge Messages ToolChoice to Chat ToolChoice for reuse
-                let chat_tool_choice = messages_request
-                    .tool_choice
-                    .as_ref()
-                    .map(utils::message_utils::convert_message_tool_choice);
+                let chat_tool_choice = messages_request.tool_choice.as_ref().map(ToolChoice::from);
 
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
@@ -1096,13 +1080,7 @@ impl ResponseProcessor {
         // Step 5: Build usage. A turn that ran with thinking reports its
         // thinking tokens: the engine's own count when it keeps one, else the
         // tokens the parser placed in the thinking span.
-        let thinking_requested = matches!(
-            &messages_request.thinking,
-            Some(
-                messages::ThinkingConfig::Enabled { .. }
-                    | messages::ThinkingConfig::Adaptive { .. }
-            )
-        );
+        let thinking_requested = messages_request.thinking_requested;
         let usage = messages_usage_from_counts(
             complete.prompt_tokens(),
             complete.completion_tokens(),
@@ -1699,7 +1677,7 @@ mod responses_finish_reason_tests {
             }))
             .unwrap();
             let mut spec = ChatResponseSpec::from(&request);
-            spec.reasoning_in_prefill = Some(true);
+            spec.reasoning_in_prefill = true;
             let tokenizer: Arc<dyn Tokenizer> =
                 Arc::new(scripted_tokenizer::ScriptedTokenizer::new(output));
             let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
