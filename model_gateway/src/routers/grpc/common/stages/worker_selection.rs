@@ -22,7 +22,8 @@ use crate::{
     routers::{
         common::{
             placement::{
-                self, CandidateFilter, PairFailure, PlacementFailure, PlacementInputs, RefusalSite,
+                self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
+                RefusalSite,
             },
             retry::mark_non_retryable,
         },
@@ -47,8 +48,11 @@ use crate::{
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
 
-/// The candidate predicate of a request carrying media references: only
-/// workers that process them themselves.
+/// The candidate predicate of a request carrying media references with no
+/// pipeline pin: only workers that process them themselves. The stage
+/// derives its own predicate from the request's media demands
+/// (`MediaDemands::accepts_refs`); the tests hand this one to the helpers.
+#[cfg(test)]
 const ACCEPTS_MEDIA_REFS: CandidateFilter<'static> = &accepts_media_refs;
 
 /// Why an EPD selection produced nothing. Only a full Prefill leg is told
@@ -329,7 +333,7 @@ impl WorkerSelectionStage {
             self.prefill_leg_needs_vision(needs_vision),
             self.decode_leg_needs_vision(&ctx.input.request_type, intermediate, media_refs),
         )
-        .with_media_refs(media_refs)
+        .with_media_refs(media_refs, ctx.state.media_refs_pipeline)
         .with_context(context_requirements);
 
         let text = prep.routing_text();
@@ -371,13 +375,28 @@ impl WorkerSelectionStage {
             decode_needs_vision: demand.decode,
         });
         let rid_key = rid_key.as_deref();
+        // The request's media demands. The single worker takes the whole
+        // request, so it must meet every one of them; the disaggregated legs
+        // take the references' predicate (a worker that processes them, on
+        // the side of the pipeline pin the plan carries) from the inputs and
+        // their vision demands from `PairDemands` in the pair selection.
+        let media = MediaDemands {
+            media_refs,
+            vision: needs_vision,
+            pipeline: if media_refs {
+                ctx.state.media_refs_pipeline
+            } else {
+                PipelinePin::Any
+            },
+        };
+        let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let inputs = PlacementInputs {
             text,
             tokens,
             headers,
             rid_key,
             cache_namespace,
-            candidate_filter: media_refs.then_some(ACCEPTS_MEDIA_REFS),
+            candidate_filter: media_refs.then_some(&accepts_refs),
             tried: &[],
         };
         let sticky_key = ctx.state.sticky_key.as_deref();
@@ -390,16 +409,8 @@ impl WorkerSelectionStage {
                 runtime: RuntimeType::Sglang,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                pipeline: PipelinePin::Any,
             });
-        // The single worker takes the whole request, so it must meet every
-        // demand of the request's media. The disaggregated legs take the
-        // media-refs predicate from here and their vision demands from
-        // `PairDemands` in the pair selection: the prefill leg's for any
-        // pixel media, the decode leg's for what a stripped leg cannot serve.
-        let media = MediaDemands {
-            media_refs,
-            vision: needs_vision,
-        };
         let accepts_media = |worker: &dyn Worker| {
             media.accepts(worker) && context_requirements.admits(worker, model_id)
         };
@@ -432,7 +443,7 @@ impl WorkerSelectionStage {
                     .admit_selection_within_budget(
                         ctx,
                         accepted,
-                        self.admit_pd_pair(model_id, inputs, sticky_key, None, media_refs, demand),
+                        self.admit_pd_pair(model_id, inputs, sticky_key, None, media, demand),
                     )
                     .await?;
                 ctx.state.pd_prefill_guard = Some(guard);
@@ -503,7 +514,11 @@ impl WorkerSelectionStage {
         }
 
         if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
-            if let Err(err) = multimodal::ensure_selection_supports_media_refs(&workers, plan) {
+            if let Err(err) = multimodal::ensure_selection_supports_media_refs(
+                &workers,
+                plan,
+                ctx.state.media_refs_pipeline,
+            ) {
                 return Err(error::bad_request(err.code(), err.to_string()));
             }
         }
@@ -550,13 +565,15 @@ impl WorkerSelectionStage {
         let headers = ctx.headers.as_ref();
         let model_id = ctx.model_id.as_str();
         let context_requirements = ctx.routing.context_requirements;
-        // The retained wire carries the media-refs pin (the helpers derive it)
-        // and the routing snapshot the pixel-media fact.
+        // The retained wire carries the media-refs pin and the pipeline pin
+        // (the helpers derive them too), the routing snapshot the pixel-media
+        // fact.
         let wire = Some(ctx.wire);
         let media_refs = ctx.wire.requires_media_refs;
         let media = MediaDemands {
-            media_refs: false,
+            media_refs,
             vision: ctx.routing.needs_vision,
+            pipeline: ctx.wire.pipeline,
         };
         // A retry skips the workers that already answered this request
         // definitively (see `routers::common::attempt_ledger`), and stays on
@@ -600,9 +617,7 @@ impl WorkerSelectionStage {
                 }
             }
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
-                let pinned = |worker: &dyn Worker| {
-                    (!media_refs || accepts_media_refs(worker)) && admits(worker)
-                };
+                let pinned = |worker: &dyn Worker| media.accepts_refs(worker) && admits(worker);
                 let inputs = PlacementInputs {
                     text,
                     tokens,
@@ -618,12 +633,12 @@ impl WorkerSelectionStage {
                         inputs,
                         ctx.sticky_key.as_deref(),
                         wire,
-                        media_refs,
+                        media,
                         PairDemands::new(
                             self.prefill_leg_needs_vision(ctx.routing.needs_vision),
                             ctx.routing.decode_needs_vision,
                         )
-                        .with_media_refs(media_refs)
+                        .with_media_refs(media_refs, ctx.wire.pipeline)
                         .with_context(context_requirements),
                     )
                     .await?;
@@ -672,7 +687,7 @@ impl WorkerSelectionStage {
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
         wire: Option<WireConstraint>,
-        media_refs: bool,
+        media: MediaDemands,
         demand: PairDemands,
     ) -> Result<(PdWorkerPair, PrefillLoadGuard), Response> {
         acquire_prefill(
@@ -684,7 +699,7 @@ impl WorkerSelectionStage {
         .await
         .map_err(|error| {
             Self::acquire_failure(model_id, error, |failure| {
-                self.pd_selection_failure(model_id, failure, media_refs)
+                self.pd_selection_failure(model_id, failure, media)
             })
         })
     }
@@ -797,6 +812,10 @@ struct PairDemands {
     /// a worker with the encoder among those, or the request could never
     /// pair and a retryable 503 would send the client back for ever.
     refs: bool,
+    /// With `refs`: which of the workers that process them the plan may use
+    /// ([`pipeline_admits`]); the probes count only the pairs on that side,
+    /// so a pair the pin excludes never stands in for one it admits.
+    pipeline: PipelinePin,
 }
 
 impl PairDemands {
@@ -809,14 +828,20 @@ impl PairDemands {
             prefill: pixel_media || decode,
             decode,
             refs: false,
+            pipeline: PipelinePin::Any,
         }
     }
 
     /// The same demand for a request that forwards media references (`refs`,
-    /// the caller's `ACCEPTS_MEDIA_REFS` filter): the prefill leg's refusal
-    /// is judged among the workers that take them.
-    fn with_media_refs(self, refs: bool) -> Self {
-        Self { refs, ..self }
+    /// the caller's references predicate) on the side of `pipeline`: the
+    /// prefill leg's refusal and the capacity refusal are judged among the
+    /// workers that take them there.
+    fn with_media_refs(self, refs: bool, pipeline: PipelinePin) -> Self {
+        Self {
+            refs,
+            pipeline: if refs { pipeline } else { PipelinePin::Any },
+            ..self
+        }
     }
 
     /// Context bounds shared by both token-processing legs, never the encoder.
@@ -875,6 +900,9 @@ struct MediaDemands {
     /// Pixel media is carried: only a worker with a vision encoder
     /// ([`vision_capable`]).
     vision: bool,
+    /// With forwarded references: which of the workers that process them the
+    /// plan may use ([`pipeline_admits`]).
+    pipeline: PipelinePin,
 }
 
 impl MediaDemands {
@@ -882,14 +910,26 @@ impl MediaDemands {
     const NONE: Self = Self {
         media_refs: false,
         vision: false,
+        pipeline: PipelinePin::Any,
     };
 
-    /// These demands plus the retained plan's media-refs pin on a retry.
+    /// These demands plus the retained plan's pins on a retry.
     fn with_wire(self, wire: Option<WireConstraint>) -> Self {
         Self {
             media_refs: self.media_refs || wire.is_some_and(|w| w.requires_media_refs),
             vision: self.vision,
+            pipeline: match self.pipeline {
+                PipelinePin::Any => wire.map_or(PipelinePin::Any, |w| w.pipeline),
+                pin => pin,
+            },
         }
+    }
+
+    /// Whether `worker` may take the request's references: it processes
+    /// them, on the side of the pipeline pin the plan carries. The vision
+    /// demand is the leg's own (see [`Self::accepts`]).
+    fn accepts_refs(self, worker: &dyn Worker) -> bool {
+        (!self.media_refs || accepts_media_refs(worker)) && pipeline_admits(self.pipeline, worker)
     }
 
     fn any(self) -> bool {
@@ -898,7 +938,18 @@ impl MediaDemands {
 
     /// Whether `worker` meets every demand.
     fn accepts(self, worker: &dyn Worker) -> bool {
-        (!self.media_refs || accepts_media_refs(worker)) && (!self.vision || vision_capable(worker))
+        self.accepts_refs(worker) && (!self.vision || vision_capable(worker))
+    }
+}
+
+/// Whether `worker` is on the side of `pin`: running the gateway's own
+/// pipeline for [`PipelinePin::Only`], not running it for
+/// [`PipelinePin::Never`], anything for [`PipelinePin::Any`].
+fn pipeline_admits(pin: PipelinePin, worker: &dyn Worker) -> bool {
+    match pin {
+        PipelinePin::Any => true,
+        PipelinePin::Only => multimodal::worker_runs_gateway_pipeline(worker),
+        PipelinePin::Never => !multimodal::worker_runs_gateway_pipeline(worker),
     }
 }
 
@@ -1120,6 +1171,17 @@ impl WorkerSelectionStage {
             if capable.is_empty() {
                 return self.media_refs_shed(model_id);
             }
+            let capable: Vec<Arc<dyn Worker>> = capable
+                .into_iter()
+                .filter(|w| pipeline_admits(media.pipeline, w.as_ref()))
+                .collect();
+            if capable.is_empty() {
+                return match media.pipeline {
+                    PipelinePin::Only => Self::pipeline_worker_required(model_id),
+                    PipelinePin::Never => Self::pipeline_takes_no_audio(model_id),
+                    PipelinePin::Any => self.media_refs_shed(model_id),
+                };
+            }
             match placement::failure_from(
                 &capable,
                 model_id,
@@ -1137,6 +1199,44 @@ impl WorkerSelectionStage {
             return Self::workers_unavailable(model_id);
         }
         error::model_not_found(model_id)
+    }
+
+    /// Workers process the model's media references, but none runs the
+    /// gateway's own pipeline, the only processor that expands this model's
+    /// placeholders. The request's own 400, as the preparation refusal for
+    /// the same model is; terminal.
+    fn pipeline_worker_required(model_id: &str) -> Response {
+        let mut response = error::bad_request(
+            "multimodal_worker_processing_unsupported_model",
+            format!(
+                "model {model_id} has workers processing media references, but none runs the \
+                 gateway's own pipeline (mm_processor={}), the only processor that expands this \
+                 model's placeholders; start the workers with --mm-processor {} or the router \
+                 with --mm-processing router",
+                multimodal::GATEWAY_PIPELINE_PROCESSOR,
+                multimodal::GATEWAY_PIPELINE_PROCESSOR
+            ),
+        );
+        mark_non_retryable(&mut response);
+        response
+    }
+
+    /// Every worker processing the model's media references runs the
+    /// gateway's own pipeline, which takes no audio. The request's own 400,
+    /// as the worker's refusal for the same request would be; terminal.
+    fn pipeline_takes_no_audio(model_id: &str) -> Response {
+        let mut response = error::bad_request(
+            "multimodal_not_supported",
+            format!(
+                "the workers processing media references for model {model_id} all run the \
+                 gateway's own pipeline (mm_processor={}), which takes image and video \
+                 references, not audio; a worker with --mm-processor inprocess or redis \
+                 processes audio with the engine's own processor",
+                multimodal::GATEWAY_PIPELINE_PROCESSOR
+            ),
+        );
+        mark_non_retryable(&mut response);
+        response
     }
 
     /// Workers serve the model but none advertises worker-side multimodal
@@ -1255,11 +1355,11 @@ impl WorkerSelectionStage {
         &self,
         model_id: &str,
         failure: PdSelectionFailure,
-        media_refs: bool,
+        media: MediaDemands,
     ) -> Response {
         match failure {
             PdSelectionFailure::Placement(failure) => {
-                self.pd_pair_failure(model_id, *failure, media_refs)
+                self.pd_pair_failure(model_id, *failure, media)
             }
             PdSelectionFailure::Context(response) => *response,
             PdSelectionFailure::NoVisionCapablePrefill => {
@@ -1433,10 +1533,13 @@ impl WorkerSelectionStage {
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
     ) -> Option<Arc<dyn Worker>> {
-        // A retry pins the retained wire, and with it the media pin, on top of
-        // whatever the caller excludes.
+        // A retry pins the retained wire, and with it the media pin and the
+        // pipeline pin, on top of whatever the caller excludes.
+        let pipeline = wire.map_or(PipelinePin::Any, |w| w.pipeline);
         let pinned = |worker: &dyn Worker| {
-            accepts_media_refs(worker) && candidate_filter.is_none_or(|accepts| accepts(worker))
+            accepts_media_refs(worker)
+                && pipeline_admits(pipeline, worker)
+                && candidate_filter.is_none_or(|accepts| accepts(worker))
         };
         let candidate_filter: Option<CandidateFilter<'_>> =
             if wire.is_some_and(|w| w.requires_media_refs) {
@@ -1489,16 +1592,42 @@ impl WorkerSelectionStage {
             .collect()
     }
 
-    fn pd_pair_failure(&self, model_id: &str, failure: PairFailure, media_refs: bool) -> Response {
-        if media_refs {
+    /// The placement's verdict for a failed pair, unless the failing leg's
+    /// pool explains it by the request's media: no worker of the leg
+    /// processes references, or none of those that do is on the side of
+    /// the plan's pipeline pin. Both are the request's own 400, as the
+    /// regular path answers them, not a retryable 503 over healthy workers.
+    fn pd_pair_failure(
+        &self,
+        model_id: &str,
+        failure: PairFailure,
+        media: MediaDemands,
+    ) -> Response {
+        if media.media_refs {
             let snapshot = self.worker_registry.get_routing_snapshot(model_id);
             let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
             let pool = match failure.leg {
                 WorkerLeg::Prefill => &pairs.prefill_pool,
                 _ => &pairs.decode_pool,
             };
-            if !pool.is_empty() && !pool.iter().any(|w| accepts_media_refs(w.as_ref())) {
-                return self.media_refs_shed(model_id);
+            if !pool.is_empty() {
+                let processing: Vec<&Arc<dyn Worker>> = pool
+                    .iter()
+                    .filter(|w| accepts_media_refs(w.as_ref()))
+                    .collect();
+                if processing.is_empty() {
+                    return self.media_refs_shed(model_id);
+                }
+                if !processing
+                    .iter()
+                    .any(|w| pipeline_admits(media.pipeline, w.as_ref()))
+                {
+                    match media.pipeline {
+                        PipelinePin::Only => return Self::pipeline_worker_required(model_id),
+                        PipelinePin::Never => return Self::pipeline_takes_no_audio(model_id),
+                        PipelinePin::Any => {}
+                    }
+                }
             }
         }
         self.pair_failure(model_id, failure)
@@ -1541,7 +1670,9 @@ impl WorkerSelectionStage {
         // workers. A pool with no pair that takes the references at all is
         // not this refusal: the placement's media-references verdict names
         // that gap, and the fix that applies to it.
-        let takes_refs = |worker: &dyn Worker| !demand.refs || accepts_media_refs(worker);
+        let takes_refs = |worker: &dyn Worker| {
+            !demand.refs || (accepts_media_refs(worker) && pipeline_admits(demand.pipeline, worker))
+        };
         if demand.prefill
             && !pairs.prefill_pool.is_empty()
             && !pairs.decode_pool.is_empty()
@@ -2070,7 +2201,7 @@ mod tests {
                 PlacementInputs::default(),
                 None,
                 None,
-                false,
+                MediaDemands::NONE,
                 PairDemands::default(),
             )
             .await
@@ -2125,7 +2256,14 @@ mod tests {
                     ..PlacementInputs::default()
                 };
                 stage
-                    .admit_pd_pair(model_id, inputs, None, None, false, PairDemands::default())
+                    .admit_pd_pair(
+                        model_id,
+                        inputs,
+                        None,
+                        None,
+                        MediaDemands::NONE,
+                        PairDemands::default(),
+                    )
                     .await
             }
         });
@@ -2183,7 +2321,14 @@ mod tests {
         };
 
         let response = stage
-            .admit_pd_pair(model_id, inputs, None, None, false, PairDemands::default())
+            .admit_pd_pair(
+                model_id,
+                inputs,
+                None,
+                None,
+                MediaDemands::NONE,
+                PairDemands::default(),
+            )
             .await
             .err()
             .expect("full explicit target must wait or reject, not reassign");
@@ -2851,6 +2996,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                pipeline: PipelinePin::Any,
             },
         );
         for _ in 0..8 {
@@ -2912,6 +3058,7 @@ mod tests {
                 runtime: RuntimeType::TokenSpeed,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                pipeline: PipelinePin::Any,
             },
         );
         let decided_on = |worker: &Arc<dyn Worker>| {
@@ -3009,6 +3156,7 @@ mod tests {
                     runtime: RuntimeType::TokenSpeed,
                     connection: ConnectionMode::Grpc,
                     requires_media_refs: false,
+                    pipeline: PipelinePin::Any,
                 },
             );
             ctx.constraint_decided_on =
@@ -3090,6 +3238,7 @@ mod tests {
                     runtime: RuntimeType::TokenSpeed,
                     connection: ConnectionMode::Grpc,
                     requires_media_refs: false,
+                    pipeline: PipelinePin::Any,
                 },
             );
             let prep = PreparationOutput::Generate {
@@ -3171,6 +3320,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                pipeline: PipelinePin::Any,
             },
         );
         let mut headers = HeaderMap::new();
@@ -3267,6 +3417,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                pipeline: PipelinePin::Any,
             },
         );
         for _ in 0..8 {
@@ -3330,6 +3481,7 @@ mod tests {
                 runtime: RuntimeType::Vllm,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs: false,
+                pipeline: PipelinePin::Any,
             },
         );
 
@@ -3396,6 +3548,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+            pipeline: PipelinePin::Any,
         };
         let namespace = |salt: &str| {
             CacheNamespace::derive(&CachePartition {
@@ -3500,6 +3653,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
+            pipeline: PipelinePin::Any,
         };
         let worker = stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -3563,6 +3717,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: true,
+            pipeline: PipelinePin::Any,
         };
         assert!(stage
             .select_single_worker(model_id, None, None, None, None, None, Some(wire), None)
@@ -3584,10 +3739,24 @@ mod tests {
     const REFS: MediaDemands = MediaDemands {
         media_refs: true,
         vision: false,
+        pipeline: PipelinePin::Any,
     };
     const VISION: MediaDemands = MediaDemands {
         media_refs: false,
         vision: true,
+        pipeline: PipelinePin::Any,
+    };
+    /// References of a family only the gateway's own pipeline expands.
+    const PIPELINE_REFS: MediaDemands = MediaDemands {
+        media_refs: true,
+        vision: false,
+        pipeline: PipelinePin::Only,
+    };
+    /// Audio references, which the gateway's own pipeline does not take.
+    const AUDIO_REFS: MediaDemands = MediaDemands {
+        media_refs: true,
+        vision: false,
+        pipeline: PipelinePin::Never,
     };
 
     /// A regular worker with `labels`, built as [`labeled_worker`] builds every
@@ -3609,6 +3778,130 @@ mod tests {
         let mut urls: Vec<String> = seen.into_keys().collect();
         urls.sort();
         urls
+    }
+
+    /// References of a family only the gateway's own pipeline expands land
+    /// only on workers running it; references of an opted-in family use every
+    /// worker that processes references, and a pool whose
+    /// reference-processing workers all run the engine's processor is the
+    /// request's own 400 for the pinned family.
+    #[test]
+    fn pinned_references_select_only_pipeline_workers() {
+        let model_id = "test-model-pipeline-pinned";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = [
+            ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        let engine = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        for (url, labels) in [
+            ("grpc://127.0.0.1:8770", &pipeline[..]),
+            ("grpc://127.0.0.1:8771", &engine[..]),
+            ("grpc://127.0.0.1:8772", UNLABELED),
+        ] {
+            worker_registry
+                .register(regular_worker(url, model_id, labels))
+                .unwrap();
+        }
+        let stage = regular_stage(Arc::clone(&worker_registry));
+
+        assert_eq!(
+            urls_seen(&stage, model_id, PIPELINE_REFS),
+            ["grpc://127.0.0.1:8770"],
+            "a pinned family goes to the pipeline worker only"
+        );
+        assert_eq!(
+            urls_seen(&stage, model_id, REFS),
+            ["grpc://127.0.0.1:8770", "grpc://127.0.0.1:8771"],
+            "an opted-in family goes to every worker that processes references"
+        );
+        assert_eq!(
+            urls_seen(&stage, model_id, AUDIO_REFS),
+            ["grpc://127.0.0.1:8771"],
+            "audio goes to the worker on the engine's own processor only"
+        );
+
+        let engine_only = "test-model-pipeline-pinned-engine-only";
+        worker_registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:8773",
+                engine_only,
+                &engine,
+            ))
+            .unwrap();
+        let response =
+            stage.selection_failure(engine_only, &[WorkerType::Regular], None, PIPELINE_REFS);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let pipeline_only = "test-model-pipeline-pinned-pipeline-only";
+        worker_registry
+            .register(regular_worker(
+                "grpc://127.0.0.1:8774",
+                pipeline_only,
+                &pipeline,
+            ))
+            .unwrap();
+        let response =
+            stage.selection_failure(pipeline_only, &[WorkerType::Regular], None, AUDIO_REFS);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A retry keeps the retained plan's pipeline pin: with the pin on the
+    /// gateway's own pipeline, a worker on the engine's processor that joined
+    /// the pool since the first attempt is never picked; with the pin off it
+    /// (audio), the pipeline worker is never picked.
+    #[tokio::test]
+    async fn reselect_keeps_the_pipeline_pin_of_the_retained_plan() {
+        let model_id = "pipeline-pin-retry-model";
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = [
+            ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        let engine = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        for (url, labels) in [
+            ("grpc://127.0.0.1:9340", &pipeline[..]),
+            ("grpc://127.0.0.1:9341", &engine[..]),
+        ] {
+            worker_registry
+                .register(regular_worker(url, model_id, labels))
+                .unwrap();
+        }
+        let stage = WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            WorkerSelectionMode::Regular,
+            None,
+        );
+        for (pin, expected) in [
+            (PipelinePin::Only, "grpc://127.0.0.1:9340"),
+            (PipelinePin::Never, "grpc://127.0.0.1:9341"),
+        ] {
+            let mut ctx = dispatch_ctx(
+                model_id,
+                WireConstraint {
+                    runtime: RuntimeType::Vllm,
+                    connection: ConnectionMode::Grpc,
+                    requires_media_refs: true,
+                    pipeline: pin,
+                },
+            );
+            for _ in 0..6 {
+                stage.reselect(&mut ctx).await.unwrap();
+                match ctx.workers.as_ref().unwrap() {
+                    WorkerSelection::Single { worker } => {
+                        assert_eq!(worker.url(), expected, "{pin:?}");
+                    }
+                    WorkerSelection::Disaggregated { .. } => panic!("expected single selection"),
+                }
+            }
+        }
     }
 
     /// Pixel media never reaches a worker labeled without a vision encoder:
@@ -3747,6 +4040,7 @@ mod tests {
         let both = MediaDemands {
             media_refs: true,
             vision: true,
+            pipeline: PipelinePin::Any,
         };
         let refs_with_vision = [
             ("mm_processor", "inprocess"),
@@ -3830,6 +4124,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+            pipeline: PipelinePin::Any,
         };
 
         let stage = &stage;
@@ -4084,7 +4379,7 @@ mod tests {
                 None,
                 PairDemands::default(),
             )
-            .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
             .expect_err("no prefill worker at all");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -4095,6 +4390,149 @@ mod tests {
             error::extract_error_code_from_response(&response),
             "no_media_ref_capable_worker"
         );
+    }
+
+    /// A prefill/decode pool whose reference-processing workers the plan's
+    /// pipeline pin excludes answers the request's own 400, the verdict the
+    /// regular path gives, not a retryable 503 over healthy workers: an
+    /// all-pipeline pool for audio, an all-engine pool for a pinned family.
+    #[test]
+    fn pd_selection_failure_reads_the_pipeline_pin() {
+        let pipeline = [
+            ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        let engine = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+        ];
+        for (model_id, labels, demands, code) in [
+            (
+                "test-model-pd-pin-audio",
+                &pipeline[..],
+                AUDIO_REFS,
+                "multimodal_not_supported",
+            ),
+            (
+                "test-model-pd-pin-only",
+                &engine[..],
+                PIPELINE_REFS,
+                "multimodal_worker_processing_unsupported_model",
+            ),
+        ] {
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            for (url, worker_type) in [
+                ("grpc://127.0.0.1:8760", WorkerType::Prefill),
+                ("grpc://127.0.0.1:8761", WorkerType::Decode),
+            ] {
+                worker_registry
+                    .register(labeled_worker(url, model_id, worker_type, labels))
+                    .unwrap();
+            }
+            let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+            let accepts_refs = |worker: &dyn Worker| demands.accepts_refs(worker);
+            let response = stage
+                .select_pd_pair(
+                    model_id,
+                    PlacementInputs {
+                        candidate_filter: Some(&accepts_refs),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    PairDemands::default(),
+                )
+                .map_err(|failure| stage.pd_selection_failure(model_id, failure, demands))
+                .expect_err("the pin empties the pool");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model_id}");
+            assert_eq!(
+                error::extract_error_code_from_response(&response),
+                code,
+                "{model_id}"
+            );
+        }
+    }
+
+    /// The prefill leg's probes count only the pairs on the side of the plan's
+    /// pipeline pin: with the pin on the gateway's own pipeline, a prefill
+    /// worker with the encoder on the engine's processor does not stand in
+    /// for the pipeline worker without one, so the request gets the vision
+    /// refusal rather than a retryable 503; off the pin, or without one, the
+    /// same pool pairs on the engine's side.
+    #[test]
+    fn the_pd_probes_count_only_the_pairs_on_the_pins_side() {
+        let model_id = "test-model-pd-pin-probe";
+        let pipeline_without_vision = [
+            ("mm_processor", multimodal::GATEWAY_PIPELINE_PROCESSOR),
+            ("mm_media_ref_schemes", "http,https,data"),
+            (multimodal::SUPPORTS_VISION_LABEL, "false"),
+        ];
+        let engine_with_vision = [
+            ("mm_processor", "inprocess"),
+            ("mm_media_ref_schemes", "http,https,data"),
+            (multimodal::SUPPORTS_VISION_LABEL, "true"),
+        ];
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type, labels) in [
+            (
+                "grpc://127.0.0.1:8780",
+                WorkerType::Prefill,
+                &pipeline_without_vision[..],
+            ),
+            (
+                "grpc://127.0.0.1:8781",
+                WorkerType::Prefill,
+                &engine_with_vision[..],
+            ),
+            (
+                "grpc://127.0.0.1:8782",
+                WorkerType::Decode,
+                &pipeline_without_vision[..],
+            ),
+            (
+                "grpc://127.0.0.1:8783",
+                WorkerType::Decode,
+                &engine_with_vision[..],
+            ),
+        ] {
+            worker_registry
+                .register(labeled_worker(url, model_id, worker_type, labels))
+                .unwrap();
+        }
+        let stage = round_robin_pd_stage(Arc::clone(&worker_registry));
+        for (pin, pairs) in [
+            (PipelinePin::Only, false),
+            (PipelinePin::Never, true),
+            (PipelinePin::Any, true),
+        ] {
+            let demands = MediaDemands {
+                media_refs: true,
+                vision: true,
+                pipeline: pin,
+            };
+            let accepts_refs = |worker: &dyn Worker| demands.accepts_refs(worker);
+            let selected = stage.select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(&accepts_refs),
+                    ..Default::default()
+                },
+                None,
+                None,
+                PairDemands::new(true, false).with_media_refs(true, pin),
+            );
+            if pairs {
+                assert!(
+                    selected.is_ok(),
+                    "{pin:?}: the engine's pair has the encoder"
+                );
+            } else {
+                assert!(
+                    matches!(selected, Err(PdSelectionFailure::NoVisionCapablePrefill)),
+                    "{pin:?}: no pipeline prefill worker has the encoder"
+                );
+            }
+        }
     }
 
     /// With the demand an image reference builds, a pool with no pair that
@@ -4135,9 +4573,9 @@ mod tests {
                 },
                 None,
                 None,
-                PairDemands::new(true, true).with_media_refs(true),
+                PairDemands::new(true, true).with_media_refs(true, PipelinePin::Any),
             )
-            .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
             .expect_err("no pair takes the references");
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -4197,7 +4635,7 @@ mod tests {
                 None,
                 PairDemands::default(),
             )
-            .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+            .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
             .expect_err("no advertising decode worker yet");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -4225,7 +4663,7 @@ mod tests {
                     None,
                     PairDemands::default(),
                 )
-                .map_err(|failure| stage.pd_selection_failure(model_id, failure, true))
+                .map_err(|failure| stage.pd_selection_failure(model_id, failure, REFS))
                 .expect("advertising pair");
             assert_eq!(prefill.url(), "grpc://127.0.0.1:8721");
             assert_eq!(decode.url(), "grpc://127.0.0.1:8731");
@@ -4286,6 +4724,7 @@ mod tests {
                 decode: false,
                 refs: false,
                 context: ContextRequirements::default(),
+                pipeline: PipelinePin::Any,
             },
             "a single-sample image: the prefill leg takes the pixels, the decode leg is stripped"
         );
@@ -4296,6 +4735,7 @@ mod tests {
                 decode: true,
                 refs: false,
                 context: ContextRequirements::default(),
+                pipeline: PipelinePin::Any,
             },
             "what the decode leg cannot run without the encoder, the prefill leg cannot either"
         );
@@ -4397,7 +4837,7 @@ mod tests {
             matches!(failure, PdSelectionFailure::NoVisionCapablePrefill),
             "{failure:?}"
         );
-        let response = stage.pd_selection_failure(uniform, failure, false);
+        let response = stage.pd_selection_failure(uniform, failure, MediaDemands::NONE);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -4542,7 +4982,7 @@ mod tests {
                 },
                 None,
                 None,
-                PairDemands::new(true, true).with_media_refs(true),
+                PairDemands::new(true, true).with_media_refs(true, PipelinePin::Any),
             )
             .expect_err("no prefill worker that takes references has the encoder");
         assert!(
@@ -4587,6 +5027,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+            pipeline: PipelinePin::Any,
         };
 
         let stage = &stage;
@@ -4777,7 +5218,7 @@ mod tests {
         let failure = stage
             .select_pd_pair(model_id, PlacementInputs::default(), None, None, demand)
             .expect_err("the admitted decode leg is all-overloaded under shedding");
-        let response = stage.pd_selection_failure(model_id, failure, false);
+        let response = stage.pd_selection_failure(model_id, failure, MediaDemands::NONE);
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             error::extract_error_code_from_response(&response),
@@ -5187,6 +5628,7 @@ mod tests {
             runtime: RuntimeType::Vllm,
             connection: ConnectionMode::Grpc,
             requires_media_refs: false,
+            pipeline: PipelinePin::Any,
         };
 
         let stage = &stage;
