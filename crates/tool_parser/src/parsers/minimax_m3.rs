@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
 use serde_json::{json, Map, Value};
@@ -43,9 +45,18 @@ const DEPTH: usize = 16;
 /// depth first, in the schema's order, but an object's later properties each keep one element
 /// while an earlier one is descended into, so what runs short loses its structure from the inside
 /// out: the nested objects first, the top-level arguments last. The budget counts elements, not
-/// bytes: a value's own spelling (an enum's words, a number's schema) is written as it is, and a
-/// property typed `null`, written as nothing, costs none.
+/// bytes: a value's own spelling (an enum's words, a number's schema) is counted by
+/// [`LEAF_BYTES`], and a property typed `null`, written as nothing, costs none.
 const NODES: usize = 1024;
+/// How many bytes the leaves of one invoke may spell: an enum's words, a number's schema with the
+/// definitions its pointers reach. Past that, a string with an enum is text as it is and a number
+/// is free text, so a value that is large, or reused through references, cannot multiply the
+/// grammar: a 5,000-word enum reached by a thousand number leaves is written while it fits, not a
+/// thousand times. The budget is each invoke's own, as [`NODES`] is, and is spent in the schema's
+/// order.
+const LEAF_BYTES: usize = 256 * 1024;
+/// What an enum's word costs beyond its length: the alternative that spells it.
+const WORD_FRAMING: usize = 36;
 
 /// MiniMax M3 format parser for tool calls.
 ///
@@ -683,11 +694,15 @@ impl MinimaxM3Parser {
 /// against [`NODES`]: once they are spent, the values still to write (the rest of an object, a
 /// list) are free text, so a wide fan-out stays bounded too; before a property is descended into,
 /// one element is held for each of the properties after it that writes one, so an early object
-/// cannot take the elements its siblings need for their own tags.
+/// cannot take the elements its siblings need for their own tags. The leaves' spellings are
+/// counted against [`LEAF_BYTES`]: an enum's words, and a number's schema with the definitions
+/// its pointers reach (those and no other, each written once per fragment); once they are spent,
+/// an enum is text as it is and a number free text.
 ///
 /// The `symphony` crate's `grammar/xml.rs` writes the same model's block from its table, and
-/// spells the same output; it follows the references and the depth cap the same way, and takes
-/// the element budget in a change of its own.
+/// spells the same output for a schema within the budgets; it follows the references and the
+/// depth cap the same way and has the same element budget, and the byte budget goes to it in a
+/// change of its own.
 struct Elements<'a> {
     root: &'a Value,
     /// The pointers of the references on the path being written, outermost first.
@@ -697,7 +712,20 @@ struct Elements<'a> {
     /// How many of them are held for the properties after the one being written, at every level
     /// of the descent together.
     reserved: usize,
+    /// The bytes the invoke's leaves may still spell.
+    leaf_bytes: usize,
+    /// The serialized size of each root definition a fragment reached, by the entry's address,
+    /// worked out once per invoke.
+    entry_bytes: HashMap<usize, usize>,
+    /// What each number leaf's fragment costs and reaches, by the leaf schema's address: `None`
+    /// for a leaf the budget refused, which it refuses again, the budget only shrinking.
+    reached_by_leaf: HashMap<usize, Option<(usize, Vec<Reached<'a>>)>>,
+    /// What each enum costs, by its word list's address.
+    enum_bytes: HashMap<usize, usize>,
 }
+
+/// A root definition a fragment reaches: its block, its name and its entry.
+type Reached<'a> = (&'static str, &'a str, &'a Value);
 
 /// How a value's schema is written: as free text, at the depth cap or behind a reference that
 /// recurs; or by its type, its references followed and on the path, `pushed` of them, which the
@@ -727,7 +755,21 @@ impl<'a> Elements<'a> {
             path: Vec::new(),
             nodes: NODES,
             reserved: 0,
+            leaf_bytes: LEAF_BYTES,
+            entry_bytes: HashMap::new(),
+            reached_by_leaf: HashMap::new(),
+            enum_bytes: HashMap::new(),
         }
+    }
+
+    /// `cost` bytes off the leaves' budget; `false` when they do not fit, when the caller writes
+    /// the value's fallback and the budget stays for a smaller leaf.
+    fn takes_bytes(&mut self, cost: usize) -> bool {
+        if cost > self.leaf_bytes {
+            return false;
+        }
+        self.leaf_bytes -= cost;
+        true
     }
 
     /// Whether the budget has an element left beyond the ones held for later siblings.
@@ -946,11 +988,23 @@ impl<'a> Elements<'a> {
             },
             Some("string") => match schema.get("enum").and_then(Value::as_array) {
                 Some(values) if !values.is_empty() && values.iter().all(Value::is_string) => {
-                    Self::one_of(values.iter().filter_map(Value::as_str))
+                    let key = std::ptr::from_ref(values) as usize;
+                    let cost = *self.enum_bytes.entry(key).or_insert_with(|| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|word| word.len() + WORD_FRAMING)
+                            .sum()
+                    });
+                    if self.takes_bytes(cost) {
+                        Self::one_of(values.iter().filter_map(Value::as_str))
+                    } else {
+                        Self::text(close)
+                    }
                 }
                 _ => Self::text(close),
             },
-            Some("integer" | "number") => self.fragment(schema),
+            Some("integer" | "number") => self.fragment(schema, close),
             _ => Self::free_text(close),
         };
         self.unwind(pushed);
@@ -979,34 +1033,105 @@ impl<'a> Elements<'a> {
         json!({ "type": "star", "content": item })
     }
 
-    /// A number's schema as the engine gets it: with the root's definitions beside it when it
-    /// still holds a local reference, so the pointer resolves once the engine compiles the
-    /// fragment alone.
-    fn fragment(&self, schema: &'a Value) -> Value {
+    /// A number's schema as the engine gets it: with the root's definitions its pointers reach
+    /// beside it, those and no other (the entry a pointer names by its first segment, and the
+    /// entries those reach), so each pointer resolves once the engine compiles the fragment
+    /// alone; a definition the schema declares itself stays. Free text up to `close` once the
+    /// leaves' byte budget cannot take the fragment, definitions included.
+    fn fragment(&mut self, schema: &'a Value, close: &str) -> Value {
+        let Some((cost, reached)) = self.reached_within(schema) else {
+            return Self::free_text(close);
+        };
+        if !self.takes_bytes(cost) {
+            return Self::free_text(close);
+        }
         let mut fragment = schema.clone();
-        if Self::holds_reference(schema) {
-            if let Some(object) = fragment.as_object_mut() {
-                for name in ["$defs", "definitions"] {
-                    if let Some(block) = self.root.get(name) {
-                        object
-                            .entry(name.to_string())
-                            .or_insert_with(|| block.clone());
-                    }
+        if let Some(object) = fragment.as_object_mut() {
+            for (block, name, entry) in reached {
+                let slot = object.entry(block.to_string()).or_insert_with(|| json!({}));
+                if let Some(entries) = slot.as_object_mut() {
+                    entries
+                        .entry(name.to_string())
+                        .or_insert_with(|| entry.clone());
                 }
             }
         }
         json!({ "type": "json_schema", "json_schema": fragment })
     }
 
-    /// Whether `schema` holds a `$ref` anywhere.
-    fn holds_reference(schema: &Value) -> bool {
-        match schema {
-            Value::Object(object) => {
-                object.contains_key("$ref") || object.values().any(Self::holds_reference)
-            }
-            Value::Array(items) => items.iter().any(Self::holds_reference),
-            _ => false,
+    /// What a number leaf's fragment costs, with the root's definitions its pointers reach,
+    /// directly or through one another (each as its block, `$defs` or `definitions`, its name,
+    /// the first segment after the block, since a pointer deeper into an entry needs the whole
+    /// entry, and its entry), when that fits what the leaves may still spell; `None` as soon as
+    /// the running count passes it, so a leaf the budget refuses costs the walk up to the budget
+    /// and no more. Worked out once per leaf schema per invoke: a leaf refused once is refused
+    /// again, the budget only shrinking.
+    fn reached_within(&mut self, schema: &'a Value) -> Option<(usize, Vec<Reached<'a>>)> {
+        let key = std::ptr::from_ref(schema) as usize;
+        if let Some(known) = self.reached_by_leaf.get(&key) {
+            return match known {
+                Some((cost, reached)) if *cost <= self.leaf_bytes => Some((*cost, reached.clone())),
+                _ => None,
+            };
         }
+        let found = self.walk_reached(schema);
+        self.reached_by_leaf.insert(key, found.clone());
+        found
+    }
+
+    /// The walk behind [`Self::reached_within`], within what the leaves may still spell.
+    fn walk_reached(&mut self, schema: &'a Value) -> Option<(usize, Vec<Reached<'a>>)> {
+        let limit = self.leaf_bytes;
+        let mut cost = json_bytes(schema);
+        if cost > limit {
+            return None;
+        }
+        let mut reached: Vec<Reached<'a>> = Vec::new();
+        let mut seen: HashSet<(&'static str, &'a str)> = HashSet::new();
+        let mut pending: Vec<&'a Value> = vec![schema];
+        while let Some(node) = pending.pop() {
+            for pointer in local_pointers(node) {
+                let Some((block, name, entry)) = self.entry_of(pointer) else {
+                    continue;
+                };
+                if !seen.insert((block, name)) {
+                    continue;
+                }
+                cost += self.entry_bytes(entry);
+                if cost > limit {
+                    return None;
+                }
+                reached.push((block, name, entry));
+                pending.push(entry);
+            }
+        }
+        Some((cost, reached))
+    }
+
+    /// The block, the name and the entry a local pointer names, the name's escapes undone (`~1`
+    /// for `/`, `~0` for `~`); nothing for a bare `#`, a pointer elsewhere or a missing entry.
+    fn entry_of(&self, pointer: &str) -> Option<(&'static str, &'a str, &'a Value)> {
+        let mut segments = pointer.strip_prefix("#/")?.split('/');
+        let block = match segments.next()? {
+            "$defs" => "$defs",
+            "definitions" => "definitions",
+            _ => return None,
+        };
+        let entries = self.root.get(block)?.as_object()?;
+        let name = segments.next()?.replace("~1", "/").replace("~0", "~");
+        let (key, entry) = entries.get_key_value(name.as_str())?;
+        Some((block, key.as_str(), entry))
+    }
+
+    /// The serialized size of a definition's entry, worked out once per invoke.
+    fn entry_bytes(&mut self, entry: &'a Value) -> usize {
+        let key = std::ptr::from_ref(entry) as usize;
+        if let Some(bytes) = self.entry_bytes.get(&key) {
+            return *bytes;
+        }
+        let bytes = json_bytes(entry);
+        self.entry_bytes.insert(key, bytes);
+        bytes
     }
 
     /// One of the words.
@@ -1041,6 +1166,65 @@ impl<'a> Elements<'a> {
             }
         }
         json!({ "type": "any_text", "excludes": excludes })
+    }
+}
+
+/// The local pointers in `schema`, wherever a `$ref`, `$dynamicRef` or `$recursiveRef` stands.
+fn local_pointers(schema: &Value) -> Vec<&str> {
+    fn collect<'v>(schema: &'v Value, pointers: &mut Vec<&'v str>) {
+        match schema {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef") {
+                        if let Some(pointer) =
+                            value.as_str().filter(|pointer| pointer.starts_with('#'))
+                        {
+                            pointers.push(pointer);
+                        }
+                    }
+                    collect(value, pointers);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect(item, pointers)),
+            _ => {}
+        }
+    }
+    let mut pointers = Vec::new();
+    collect(schema, &mut pointers);
+    pointers
+}
+
+/// About how many bytes `value` takes serialized, the escapes counted: what a leaf costs the
+/// invoke's byte budget.
+fn json_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(flag) => {
+            if *flag {
+                4
+            } else {
+                5
+            }
+        }
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => {
+            text.len()
+                + 2
+                + text
+                    .bytes()
+                    .filter(|byte| matches!(byte, b'"' | b'\\') || *byte < 0x20)
+                    .count()
+        }
+        Value::Array(items) => {
+            2 + items.iter().map(json_bytes).sum::<usize>() + items.len().saturating_sub(1)
+        }
+        Value::Object(object) => {
+            2 + object
+                .iter()
+                .map(|(key, value)| key.len() + 3 + json_bytes(value))
+                .sum::<usize>()
+                + object.len().saturating_sub(1)
+        }
     }
 }
 
