@@ -22,9 +22,23 @@ use crate::{
     },
 };
 
-/// A set of unique `(worker type, connection mode, model id)` groups: the key
-/// the pool-size gauge is kept by.
-pub(crate) type PoolGroups = HashSet<(WorkerType, ConnectionMode, String)>;
+/// The key the pool-size gauge is kept by: a worker's type, connection mode
+/// and primary model id.
+pub(crate) type PoolGroup = (WorkerType, ConnectionMode, String);
+
+/// A set of unique pool groups.
+pub(crate) type PoolGroups = HashSet<PoolGroup>;
+
+/// The pool-size gauge's key for one worker. Registration and removal key the
+/// gauge through this, so the two cannot drift apart.
+pub(crate) fn pool_group(worker: &dyn Worker) -> PoolGroup {
+    let meta = worker.metadata();
+    (
+        meta.spec.worker_type,
+        meta.spec.connection_mode,
+        worker.model_id().to_string(),
+    )
+}
 
 /// Set the worker pool-size gauge of each group in `groups` to the registry's
 /// current count of that group, after workers joined or left it.
