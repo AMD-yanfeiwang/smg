@@ -626,6 +626,8 @@ struct Router {
     mesh_tls_cert: Option<String>,
     mesh_tls_key: Option<String>,
     power_of_two_load_metric: String,
+    /// Keyword-only: the optional fields of the access-log record.
+    access_log_fields: Vec<String>,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -779,6 +781,21 @@ impl Router {
                 })
             })
             .transpose()?;
+
+        // The access-log fields by name, each spelled as the record keys it.
+        let access_log_fields = self
+            .access_log_fields
+            .iter()
+            .map(|name| {
+                name.parse::<config::AccessLogField>().map_err(|reason| {
+                    config::ConfigError::InvalidValue {
+                        field: "access_log_fields".to_string(),
+                        value: name.clone(),
+                        reason,
+                    }
+                })
+            })
+            .collect::<config::ConfigResult<Vec<_>>>()?;
 
         let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
             &self.power_of_two_load_metric,
@@ -1168,6 +1185,7 @@ impl Router {
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
+            .access_log_fields(access_log_fields)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -1406,6 +1424,7 @@ impl Router {
         mesh_tls_key = None,
         power_of_two_load_metric = String::from("expected_wait"),
         discovery = None,
+        access_log_fields = vec![],
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1609,6 +1628,7 @@ impl Router {
         mesh_tls_key: Option<String>,
         power_of_two_load_metric: String,
         discovery: Option<Bound<'_, PyAny>>,
+        access_log_fields: Vec<String>,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
         if service_discovery && discovery.is_some() {
@@ -1840,6 +1860,7 @@ impl Router {
             mesh_tls_cert,
             mesh_tls_key,
             power_of_two_load_metric,
+            access_log_fields,
         })
     }
 
