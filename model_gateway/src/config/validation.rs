@@ -277,6 +277,57 @@ pub fn bind_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     parse_bind_host(host).map(|ip| SocketAddr::new(ip, port))
 }
 
+/// The listener address of the RDMA pixel lane's metadata exchange
+/// (`--rdma-listen-ip`, `SMG_RDMA_LISTEN_IP`): a plain IPv4 or IPv6 address,
+/// surrounding whitespace aside. The workers connect to the address as it is
+/// written, so a hostname, a port or the brackets of a `host:port` string are
+/// refused with everything else that is not an IP address; `999.1.1.1` used
+/// to pass and fail only when the lane came up, far from the flag.
+pub(crate) fn parse_listen_ip(value: &str) -> Result<IpAddr, String> {
+    value.trim().parse::<IpAddr>().map_err(|_| {
+        format!("invalid listen IP '{value}': expected an IP address such as 10.0.0.7 or fd00::1")
+    })
+}
+
+/// The most worker threads an explicit `runtime_worker_threads` may ask
+/// for, on every host alike: the counts that are a typo or a misread unit
+/// (10,000; 100,000), each of which is a stack and a thread the scheduler
+/// wakes for nothing, are refused without reading the host, so a
+/// configuration that validates on one host validates on another (a pod
+/// under a cgroup CPU quota included). A few times the CPUs of the largest
+/// hosts, not a budget.
+pub const RUNTIME_WORKER_THREADS_CEILING: usize = 4096;
+
+/// Worker threads per CPU available to the process above which an explicit
+/// count is an oversubscription worth a warning: a worker thread beyond the
+/// CPUs only waits for one. Advice at start-up, not a refusal: a runtime
+/// deliberately oversubscribed (handlers that block a worker) is the
+/// operator's choice, which the host's quota must not veto.
+pub const RUNTIME_WORKER_THREADS_PER_CPU: usize = 4;
+
+/// The warning for an explicit `runtime_worker_threads` above
+/// [`RUNTIME_WORKER_THREADS_PER_CPU`] x the `cpus` available to the process
+/// (never under one CPU's worth: a parallelism that cannot be read counts as
+/// one), `None` within it. Pure over the CPU count so the rule is testable;
+/// start-up logs it where it logs the runtime's size.
+pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> Option<String> {
+    let advised = cpus.max(1).saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU);
+    (threads > advised).then(|| {
+        format!(
+            "runtime_worker_threads {threads} is above {advised}, \
+             {RUNTIME_WORKER_THREADS_PER_CPU} x the {cpus} CPUs available to this process: a \
+             worker thread beyond the CPUs only waits for one and costs its stack"
+        )
+    })
+}
+
+/// The CPUs available to this process, as the runtime's own default reads
+/// them (the affinity mask and the cgroup quota included); 1 when the count
+/// cannot be read.
+pub fn available_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
@@ -1083,6 +1134,23 @@ impl ConfigValidator {
             });
         }
 
+        // The RDMA pixel lane's listener: an IP address or nothing (blank is
+        // unset, as the lane reads it). Anything else used to pass here and
+        // fail when the lane came up, far from the flag that caused it.
+        if let Some(ip) = config
+            .rdma_listen_ip
+            .as_deref()
+            .filter(|ip| !ip.trim().is_empty())
+        {
+            if let Err(reason) = parse_listen_ip(ip) {
+                return Err(ConfigError::InvalidValue {
+                    field: "rdma_listen_ip".to_string(),
+                    value: ip.to_string(),
+                    reason,
+                });
+            }
+        }
+
         if config.port == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "port".to_string(),
@@ -1139,13 +1207,34 @@ impl ConfigValidator {
         }
 
         // The async runtime builder panics on zero worker threads; refuse it
-        // here like every other count that must be positive.
-        if config.runtime_worker_threads == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "runtime_worker_threads".to_string(),
-                value: "0".to_string(),
-                reason: "Must be >= 1".to_string(),
-            });
+        // here like every other count that must be positive. Above the
+        // ceiling every worker thread is one more stack and one more thread
+        // the scheduler wakes for nothing: a count of 100,000 used to pass,
+        // build its threads for over a minute and hold gigabytes before the
+        // first bind. Both are refused here, before the command line builds
+        // the runtime, so a refused count costs no thread. The ceiling reads
+        // nothing of the host, so the verdict is the same on every host; an
+        // oversubscription of the host's CPUs is a warning at start-up.
+        match config.runtime_worker_threads {
+            Some(0) => {
+                return Err(ConfigError::InvalidValue {
+                    field: "runtime_worker_threads".to_string(),
+                    value: "0".to_string(),
+                    reason: "Must be >= 1".to_string(),
+                });
+            }
+            Some(threads) if threads > RUNTIME_WORKER_THREADS_CEILING => {
+                return Err(ConfigError::InvalidValue {
+                    field: "runtime_worker_threads".to_string(),
+                    value: threads.to_string(),
+                    reason: format!(
+                        "Must be at most {RUNTIME_WORKER_THREADS_CEILING} (a worker thread is a \
+                         stack and a thread the scheduler wakes; a count this size is a typo or \
+                         a misread unit)"
+                    ),
+                });
+            }
+            Some(_) | None => {}
         }
 
         // A zero-capacity job channel panics at construction and a
@@ -2449,6 +2538,126 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The ceiling on the count reads nothing of the host: 1, the host's CPU
+    /// count, a deliberate oversubscription of it and the ceiling itself pass
+    /// on every host, while one more and the 100,000 that a typo once got
+    /// through with are refused naming the ceiling.
+    #[test]
+    fn runtime_worker_threads_above_the_ceiling_are_rejected_on_every_host_alike() {
+        let cpus = available_cpus();
+        assert!(cpus >= 1);
+        let with = |threads: usize| RouterConfig {
+            runtime_worker_threads: Some(threads),
+            ..Default::default()
+        };
+        for ok in [
+            1,
+            cpus,
+            cpus.saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU + 4),
+            RUNTIME_WORKER_THREADS_CEILING,
+        ] {
+            assert!(
+                ConfigValidator::validate(&with(ok)).is_ok(),
+                "{ok} worker threads, at most {RUNTIME_WORKER_THREADS_CEILING}"
+            );
+        }
+        for bad in [RUNTIME_WORKER_THREADS_CEILING + 1, 100_000] {
+            match ConfigValidator::validate(&with(bad)) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "runtime_worker_threads", "{bad}");
+                    assert_eq!(value, bad.to_string());
+                    assert!(
+                        reason.contains(&format!("at most {RUNTIME_WORKER_THREADS_CEILING}")),
+                        "{bad}: {reason}"
+                    );
+                }
+                other => panic!("{bad} worker threads: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A count above a small multiple of the CPUs available to the process
+    /// is a warning, not a refusal: the pure rule names the advised count
+    /// and the CPUs, says nothing within it, counts an unreadable
+    /// parallelism as one CPU, and the validator passes such a count.
+    #[test]
+    fn runtime_worker_threads_above_four_per_cpu_warn_without_a_refusal() {
+        assert_eq!(runtime_worker_threads_oversubscription(8, 2), None);
+        assert_eq!(runtime_worker_threads_oversubscription(1, 0), None);
+        let warning = runtime_worker_threads_oversubscription(16, 2).expect("a warning");
+        assert!(
+            warning.contains("runtime_worker_threads 16 is above 8")
+                && warning.contains("2 CPUs available"),
+            "{warning}"
+        );
+        let warning = runtime_worker_threads_oversubscription(5, 0).expect("a warning");
+        assert!(warning.contains("is above 4"), "{warning}");
+
+        let config = RouterConfig {
+            runtime_worker_threads: Some(
+                available_cpus()
+                    .saturating_mul(16)
+                    .min(RUNTIME_WORKER_THREADS_CEILING),
+            ),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The RDMA lane's listener address is an IP address or nothing: a plain
+    /// IPv4 or IPv6 literal passes (padding aside; blank is unset, as the lane
+    /// reads it), while a non-address, a hostname, a port or brackets are
+    /// refused naming the field, before the lane comes up.
+    #[test]
+    fn rdma_listen_ip_must_be_an_ip_address_when_set() {
+        for ok in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("10.0.0.7"),
+            Some(" 10.0.0.7 "),
+            Some("0.0.0.0"),
+            Some("fd00::1"),
+            Some("::1"),
+        ] {
+            let config = RouterConfig {
+                rdma_listen_ip: ok.map(str::to_string),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "999.1.1.1",
+            "10.0.0",
+            "gateway.example",
+            "10.0.0.7:18515",
+            "[fd00::1]",
+            "fd00::1%eth0",
+            "::1/128",
+        ] {
+            let config = RouterConfig {
+                rdma_listen_ip: Some(bad.to_string()),
+                ..Default::default()
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "rdma_listen_ip", "{bad}");
+                    assert_eq!(value, bad);
+                    assert!(reason.contains("expected an IP address"), "{bad}: {reason}");
+                }
+                other => panic!("{bad}: expected a refusal, got {other:?}"),
+            }
+        }
     }
 
     fn log_dir_config(log_dir: &str) -> RouterConfig {

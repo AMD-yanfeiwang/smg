@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import ipaddress
 import logging
 import os
 
@@ -68,6 +69,29 @@ def _non_negative_int(value: str) -> int:
     if number < 0:
         raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
     return number
+
+
+def _ip_address(value: str) -> str | None:
+    """argparse type for a listener address the router validates as an IP address:
+    a plain IPv4 or IPv6 literal, surrounding whitespace aside (blank is unset, as
+    the router reads it); a hostname, a port or brackets are refused here with the
+    reason, as the CLI refuses them before anything binds."""
+    address = value.strip()
+    if not address:
+        return None
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
+        ) from None
+    if getattr(ip, "scope_id", None):
+        # A scoped IPv6 literal (fd00::1%eth0) parses here and not in the
+        # router; the two refuse the same.
+        raise argparse.ArgumentTypeError(
+            f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
+        )
+    return address
 
 
 @dataclasses.dataclass
@@ -1367,11 +1391,12 @@ class RouterArgs:
         )
         parser.add_argument(
             f"--{prefix}rdma-listen-ip",
-            type=str,
+            type=_ip_address,
             default=RouterArgs.rdma_listen_ip,
             help=(
-                "Listener IP for the RDMA pixel lane's metadata exchange; without one"
-                " the lane stays on the inline path. Falls back to SMG_RDMA_LISTEN_IP"
+                "Listener IP for the RDMA pixel lane's metadata exchange, a plain IPv4 or"
+                " IPv6 address (no hostname, port or brackets); without one the lane stays"
+                " on the inline path. Falls back to SMG_RDMA_LISTEN_IP"
             ),
         )
         parser.add_argument(
