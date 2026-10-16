@@ -35,6 +35,8 @@ use crate::{
     word_cache::{LateBoundModel, LoadingTokenizer, ModelView, TokenizerOf},
 };
 
+mod glm;
+
 #[derive(Debug, Clone, Copy)]
 enum Renderer {
     Jinja,
@@ -69,6 +71,9 @@ pub struct HuggingFaceTokenizer {
     eos_token_ids: Vec<TokenIdType>,
     /// Which renderer applies chat templates for this model.
     renderer: Renderer,
+    /// Checkpoint identity and media policy resolved when binding the template.
+    glm: Option<glm::Checkpoint>,
+    media_handling: crate::traits::MediaHandling,
     /// What that renderer answers around a render when it has an encoder of
     /// its own ([`Renderer::profile`]), built once with it.
     profile: Option<RendererProfile>,
@@ -442,6 +447,7 @@ impl HuggingFaceTokenizer {
         Ok(tokenizer)
     }
 
+    /// Bind checkpoint metadata, the active template, and its cached renderer policy.
     fn from_built_tokenizer(
         mut tokenizer: LoadingTokenizer,
         tokenizer_path: &Path,
@@ -516,6 +522,11 @@ impl HuggingFaceTokenizer {
         let tokenizer = HfTokenizer::from(tokenizer);
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
+        let chat_template = ChatTemplateState::new(chat_template_str)?;
+        let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
+        let media_handling = glm.as_ref().map_or_else(Default::default, |_| {
+            glm::Checkpoint::media_handling(&chat_template)
+        });
         Ok(HuggingFaceTokenizer {
             byte_level: ByteLevelTable::build(&tokenizer),
             pieces: PieceTable::build(&tokenizer),
@@ -526,7 +537,9 @@ impl HuggingFaceTokenizer {
             special_tokens,
             vocab,
             reverse_vocab,
-            chat_template: ChatTemplateState::new(chat_template_str)?,
+            chat_template,
+            glm,
+            media_handling,
             response_template,
             eos_token_ids,
             profile: renderer.profile(),
@@ -687,6 +700,8 @@ impl HuggingFaceTokenizer {
             response_template: None,
             eos_token_ids: Vec::new(), // No directory path in from_tokenizer
             renderer: Renderer::Jinja,
+            glm: None,
+            media_handling: Default::default(),
             profile: None,
             has_byte_fallback,
             byte_fallback_values,
@@ -1478,14 +1493,18 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         )
     }
 
+    /// Combine native profiles with checkpoint-specific Jinja media handling.
     fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
         // A renderer with an encoder of its own answers from its profile; the
         // Jinja renderer continues a trailing assistant message the way
         // transformers' `continue_final_message` does.
-        self.profile
-            .map_or(RendererProfile::TEMPLATE_CAPABILITIES, |profile| {
-                profile.capabilities
-            })
+        self.profile.map_or_else(
+            || crate::traits::RendererCapabilities {
+                media_handling: self.media_handling,
+                ..RendererProfile::TEMPLATE_CAPABILITIES
+            },
+            |profile| profile.capabilities,
+        )
     }
 
     fn native_thinking_mode(
@@ -1498,8 +1517,13 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .map(|resolve| resolve(template_kwargs, thinking))
     }
 
+    /// Refresh media handling only after a replacement template compiles successfully.
     fn set_chat_template(&mut self, template: String) -> Result<()> {
-        self.chat_template.set(template)
+        self.chat_template.set(template)?;
+        self.media_handling = self.glm.as_ref().map_or_else(Default::default, |_| {
+            glm::Checkpoint::media_handling(&self.chat_template)
+        });
+        Ok(())
     }
 }
 
