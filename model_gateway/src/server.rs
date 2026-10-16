@@ -1409,6 +1409,38 @@ fn supervise_discovery(
     abort
 }
 
+/// [`startup`] on `runtime` to its end, then the process-wide observability
+/// closed behind it, on every exit alike: the log writers are flushed and
+/// stopped, then the tracer is flushed and shut down (a bounded wait, see
+/// [`otel_trace::shutdown_otel`]), and only then is the result read. A
+/// failed start-up used to return before the tracer's shutdown, and the
+/// spans the batch exporter still held were lost with the process. The
+/// result is `startup`'s own: the error line and the exit code are the
+/// caller's, as before. The runtime stays up throughout: the exporter's
+/// connection lives on it, and the shutdown is driven from it, so a
+/// current-thread runtime serves as well as a multi-thread one.
+///
+/// For a caller whose process goes on after the server (a language
+/// binding), [`startup`] alone is the entry point.
+pub fn run(
+    runtime: &tokio::runtime::Runtime,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let served = runtime.block_on(Box::pin(startup(config)));
+    // The writer threads outlive `startup` (a process may start more than one
+    // router); flush and stop them now that this process is done logging.
+    logging::close_logging();
+    // Driven from the runtime: on a current-thread runtime nothing else polls
+    // the exporter's connection while the shutdown waits for the export.
+    if let Err(e) = runtime.block_on(runtime.spawn_blocking(otel_trace::shutdown_otel)) {
+        #[expect(clippy::print_stderr)]
+        {
+            eprintln!("[tracing] OpenTelemetry shutdown task failed: {e}");
+        }
+    }
+    served
+}
+
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
     crate::tls::install_crypto_provider();
 
