@@ -69,7 +69,7 @@ from smg_grpc_servicer.vllm.config_view import (
     mm_processor_kwargs,
     multimodal_config,
 )
-from smg_grpc_servicer.vllm.launcher_switch import SUPPORTED_VLLM_RELEASES
+from smg_grpc_servicer.vllm.launcher_switch import LAUNCHER_MODULES, SUPPORTED_VLLM_RELEASES
 from smg_grpc_servicer.vllm.media_refs import FETCHABLE_MODALITIES
 from smg_grpc_servicer.vllm.model_info import (
     constrained_decoding_start,
@@ -96,6 +96,10 @@ KV_EVENTS_ENV = "SMG_VLLM_SERVICER_KV_EVENTS"
 MULTIPROC_METHOD_ENV = "VLLM_WORKER_MULTIPROC_METHOD"
 # What upstream's gRPC entrypoint references when it carries the switch.
 HOOK_SYMBOL = "resolve_servicer_impl"
+# The launcher files the switch binds when they are imported, by module name
+# (``launcher_switch.LAUNCHER_MODULES``), relative to the vLLM package: derived
+# from the one list, so a layout added there is counted by the preflight too.
+LAUNCHER_PATHS = tuple(os.path.join(*name.split(".")[1:]) + ".py" for name in LAUNCHER_MODULES)
 
 
 def model_info_from_config(vllm_config: Any, *, log_stats: bool | None = None) -> dict[str, Any]:
@@ -622,12 +626,16 @@ def require_python_media_mode(
 
 def upstream_hook_installed(vllm_root: str | None = None) -> bool:
     """Whether the installed vLLM's gRPC entrypoint will consult this
-    package's flag: it carries the check in its own source, or it imports
-    this package's servicer modules at module level, where the switch
-    installs itself (:mod:`smg_grpc_servicer.vllm.launcher_switch`). Scans
-    the launcher source without importing vLLM, so a launcher (``smg serve``,
-    the e2e harness) can refuse a Rust lane up front instead of starting
-    workers that would run Python."""
+    package's flag: a launcher at a module path the switch binds
+    (:data:`LAUNCHER_PATHS`) imports this package's servicer modules at
+    module level, where the switch installs itself
+    (:mod:`smg_grpc_servicer.vllm.launcher_switch`), or a launcher anywhere
+    under ``entrypoints/`` carries the check in its own source. A launcher of
+    another shape (the module moved, the import absent) is never bound, so it
+    does not count even where it imports this package. Scans the launcher
+    source without importing vLLM, so a launcher (``smg serve``, the e2e
+    harness) can refuse a Rust lane up front instead of starting workers that
+    would run Python."""
     roots: list[str] = []
     if vllm_root is not None:
         roots = [vllm_root]
@@ -639,20 +647,26 @@ def upstream_hook_installed(vllm_root: str | None = None) -> bool:
         if spec is not None:
             roots = list(spec.submodule_search_locations or [])
     for root in roots:
-        launcher = os.path.join(root, "entrypoints", "launchers", "grpc_server.py")
-        if os.path.isfile(launcher):
-            candidates = [launcher]
-        else:  # the launcher moved; scan the entrypoints tree
-            candidates = glob.glob(os.path.join(root, "entrypoints", "**", "*.py"), recursive=True)
-        for path in candidates:
-            try:
-                with open(path, encoding="utf-8") as handle:
-                    source = handle.read()
-            except OSError:
-                continue
-            if HOOK_SYMBOL in source or _imports_servicer_at_module_level(source):
+        known = [os.path.join(root, relative) for relative in LAUNCHER_PATHS]
+        for path in known:
+            source = _read_source(path)
+            if source is not None and (
+                HOOK_SYMBOL in source or _imports_servicer_at_module_level(source)
+            ):
+                return True
+        for path in glob.glob(os.path.join(root, "entrypoints", "**", "*.py"), recursive=True):
+            source = None if path in known else _read_source(path)
+            if source is not None and HOOK_SYMBOL in source:
                 return True
     return False
+
+
+def _read_source(path: str) -> str | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        return None
 
 
 _SWITCH_MODULES = (
@@ -716,7 +730,9 @@ def require_upstream_hook() -> None:
         raise RuntimeError(
             f"{SERVICER_IMPL_ENV}=rust needs a vLLM whose gRPC launcher consults this "
             "package's flag: one that imports smg_grpc_servicer.vllm.servicer at module "
-            "level (where the switch installs itself) or carries the check in its own "
+            "level from a module path the switch binds (vllm/entrypoints/launchers/"
+            "grpc_server.py, or vllm/entrypoints/grpc_server.py on vLLM 0.28 and 0.29, "
+            "where the switch installs itself) or carries the check in its own "
             "serve_grpc. This installation's launcher does neither, so its workers would "
             "run the Python servicer; see grpc_servicer/README.md or select python."
         )
