@@ -58,13 +58,13 @@ use symphony::{
     Declared, Engine, EngineFinish, Event, Events, Format, Grammar, Input, OutputAnswer,
     OutputChoice, Parser as _, TokenSpan, Turn,
 };
-use tool_parser::{GrammarStart, ToolConstraint};
+use tool_parser::ToolConstraint;
 use tracing::debug;
 
 use self::template::Templates;
 use crate::{
     config::{ParserChoice, TEMPLATE_PARSER},
-    routers::grpc::utils::Names,
+    routers::grpc::utils::{Names, WorkerDecoding},
 };
 
 /// The request header that names the parser for one request, `legacy` or `symphony`, over the
@@ -564,11 +564,14 @@ pub(crate) struct WorkerConstraint {
     /// The constraint is the whole turn's grammar, which holds the request's own format: the
     /// engine's request carries none beside it.
     pub whole_turn: bool,
+    /// The worker's policy chose the constraint (the whole turn's grammar or the `auto` tag), not
+    /// the request: a worker of another policy would not send it.
+    pub by_policy: bool,
 }
 
 /// What constrains a request's output on the worker selected for it, whose engine takes a grammar
-/// on every turn or only when the request asks (`policy`) and starts it where `start` says (under
-/// PD the decode worker's). The one place a worker's policy decides:
+/// on every turn or only when the request asks and starts it where its label says (`decoding`,
+/// under PD the decode worker's). The one place a worker's policy decides:
 ///
 /// - `requested`, the default: what preparation found (`prepared`), its refusal included.
 /// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
@@ -576,29 +579,37 @@ pub(crate) struct WorkerConstraint {
 /// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
 ///   and when that is nothing, the table's tag for the calls `auto` allows (`auto`,
 ///   [`auto_constraint`]).
+///
+/// When the policy chose the constraint, a retry re-selects only workers that decide alike
+/// ([`WorkerDecoding::decides_alike`]).
 pub(crate) fn worker_constraint(
-    policy: ConstrainedDecoding,
-    start: GrammarStart,
+    decoding: WorkerDecoding,
     prepared: PreparedConstraint,
     turn: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
     auto: impl FnOnce() -> Result<Option<ToolConstraint>, String>,
 ) -> Result<WorkerConstraint, String> {
-    let always = policy == ConstrainedDecoding::Always;
-    if always && start == GrammarStart::FirstToken {
+    let always = decoding.policy == ConstrainedDecoding::Always;
+    if decoding.takes_the_whole_turn() {
         if let Some(constraint) = turn()? {
             return Ok(WorkerConstraint {
                 constraint: Some(constraint),
                 whole_turn: true,
+                by_policy: true,
             });
         }
     }
-    let constraint = match prepared? {
-        None if always => auto()?,
-        prepared => prepared,
+    let (constraint, by_policy) = match prepared? {
+        None if always => {
+            let tag = auto()?;
+            let by_policy = tag.is_some();
+            (tag, by_policy)
+        }
+        prepared => (prepared, false),
     };
     Ok(WorkerConstraint {
         constraint,
         whole_turn: false,
+        by_policy,
     })
 }
 
@@ -1049,6 +1060,7 @@ mod tests {
     use llm_tokenizer::registry::TokenizerRegistry;
     use serde_json::{json, Value};
     use symphony::{formats::qwen3, CallSyntax};
+    use tool_parser::GrammarStart;
 
     use super::*;
 
@@ -2467,8 +2479,7 @@ mod tests {
         let decide = |policy, start, prepared: PreparedConstraint, turn: PreparedConstraint| {
             let built = std::cell::RefCell::new(Vec::new());
             let decided = worker_constraint(
-                policy,
-                start,
+                WorkerDecoding { policy, start },
                 prepared,
                 || {
                     built.borrow_mut().push("turn");
@@ -2481,11 +2492,12 @@ mod tests {
             )
             .map(|decided| {
                 let text = decided.constraint.map(|constraint| constraint.to_tuple().1);
-                (text, decided.whole_turn)
+                (text, decided.whole_turn, decided.by_policy)
             });
             (decided, built.into_inner())
         };
-        let found = |text: &str| Ok((Some(text.to_string()), false));
+        // The `auto` tag is the policy's choice; what preparation found is the request's.
+        let found = |text: &str| Ok((Some(text.to_string()), false, text == "auto"));
 
         // `requested`: what preparation found, its refusal included; nothing else is built.
         for start in [FirstToken, AfterReasoning, Unknown] {
@@ -2504,14 +2516,14 @@ mod tests {
             );
             assert_eq!(
                 decide(Requested, start, Ok(None), Ok(Some(tag("turn")))),
-                (Ok((None, false)), vec![])
+                (Ok((None, false, false)), vec![])
             );
         }
         // `always` from the first token: the whole turn's grammar stands over what preparation
         // found or refused, and its refusal refuses the request.
         assert_eq!(
             decide(Always, FirstToken, refused("no tag"), Ok(Some(tag("turn")))),
-            (Ok((Some("turn".to_string()), true)), vec!["turn"])
+            (Ok((Some("turn".to_string()), true, true)), vec!["turn"])
         );
         assert_eq!(
             decide(Always, FirstToken, Ok(None), refused("cannot hold")),
@@ -2550,6 +2562,18 @@ mod tests {
                 (found("auto"), vec!["auto"])
             );
         }
+        // Where the table gives no `auto` tag, the policy chose nothing.
+        let nothing = worker_constraint(
+            WorkerDecoding {
+                policy: Always,
+                start: AfterReasoning,
+            },
+            Ok(None),
+            || Ok(None),
+            || Ok(None),
+        )
+        .unwrap();
+        assert!(nothing.constraint.is_none() && !nothing.by_policy);
     }
 
     /// A table whose calls spell a whole turn: a call's header names the tool, its parameters
