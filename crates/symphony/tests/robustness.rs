@@ -15,10 +15,13 @@
 //! a string-valued arguments streams as written, and the JSON prefix judge refuses such a string
 //! whole, so there the pieces say the string's bytes before the break where the whole says
 //! nothing; the one stated exception to the chunking rule, held by the assemblers' own tests.
-//! No piece holds a broken escape, and an output in which a concatenation (a lone `\` before an
-//! escape) or a corruption (a cut inside an escape) built one anyway is skipped under its seed (a
-//! few per cent of the outputs; the count is on the diagnostic line), so a long audit never
-//! reports the known exception as a failure.
+//! No piece holds a broken escape, but a concatenation (a lone `\` before an escape) or a
+//! corruption (a cut inside an escape) builds one in a few per cent of the outputs. Those are
+//! checked like every other; a difference between whole and pieces is forgiven, and counted on
+//! the diagnostic line, only when it is exactly the stated shape: the output holds a broken
+//! escape, the whole said nothing for a call's arguments where the pieces said a top-level
+//! string's bytes, and the malformed text differs by those bytes alone. A panic, a contract
+//! breach and any other difference (a break inside an object included) fail the case.
 //!
 //! `SYMPHONY_SCRAMBLE_CASES=n` sets the outputs per table, variant and declaration (one hundred
 //! by default; a longer run for an audit), `SYMPHONY_SCRAMBLE_SEED=n` the first seed, so a run can
@@ -697,6 +700,10 @@ fn check(
         adapt_all(&events);
         let said = Said::of(&events);
         if said != expected {
+            if is_the_stated_exception(text, &expected, &said) {
+                FORGIVEN.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
             return Err(format!(
                 "{name} {cuts:?} says something else:\n  whole: {expected:?}\n  cut:   {said:?}"
             ));
@@ -741,17 +748,182 @@ fn subjects() -> Vec<(Table, Variant, bool)> {
     subjects
 }
 
-/// The scrambles of one subject, each in its own seed: the failures, each naming what replays it.
-/// Outputs skipped for holding a broken surrogate escape (the stated exception), for the
-/// diagnostic line.
-static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+/// Differences between whole and pieces forgiven as the stated exception, for the diagnostic
+/// line.
+static FORGIVEN: AtomicUsize = AtomicUsize::new(0);
+
+/// The one stated exception to the chunking rule (see the module doc), told from every other
+/// difference: the output holds a broken surrogate escape; everything said is the same but the
+/// calls' arguments and the malformed text; for every call whose arguments differ, the whole
+/// said nothing and the pieces said a top-level string's bytes (a leading `"`); and the pieces
+/// said under `Malformed` the same reasons in the same order, and the whole's malformed text is
+/// the pieces' with the bytes they said as arguments put back, in order, where the whole refused
+/// them (an exact comparison), so no byte is lost, invented, changed or re-judged either way.
+fn is_the_stated_exception(text: &str, whole: &Said, cut: &Said) -> bool {
+    if !holds_a_broken_surrogate_escape(text)
+        || whole.content != cut.content
+        || whole.reasoning != cut.reasoning
+        || whole.dropped != cut.dropped
+        || whole.calls != cut.calls
+        || whole.ended != cut.ended
+        || whole.finish != cut.finish
+        || whole.arguments.len() != cut.arguments.len()
+    {
+        return false;
+    }
+    let mut moved: Vec<&str> = Vec::new();
+    for ((whole_index, whole_arguments), (cut_index, cut_arguments)) in
+        whole.arguments.iter().zip(&cut.arguments)
+    {
+        if whole_index != cut_index {
+            return false;
+        }
+        if whole_arguments == cut_arguments {
+            continue;
+        }
+        if !whole_arguments.is_empty() || !cut_arguments.starts_with('"') {
+            return false;
+        }
+        moved.push(cut_arguments);
+    }
+    if moved.is_empty()
+        || !whole
+            .malformed
+            .iter()
+            .map(|(why, _)| why)
+            .eq(cut.malformed.iter().map(|(why, _)| why))
+    {
+        return false;
+    }
+    // Entry by entry (one per reason, in order): the pieces' text with the moved bytes put
+    // back, in stream order, is the whole's text. A cursor per entry starts where the last
+    // put-back ended, so a later call's bytes are never put back too early, and a byte that
+    // crossed a reason is a difference.
+    let mut rest: Vec<String> = cut.malformed.iter().map(|(_, text)| text.clone()).collect();
+    let mut cursors = vec![0usize; rest.len()];
+    'moved: for bytes in moved {
+        for (entry, (_, whole_text)) in whole.malformed.iter().enumerate() {
+            let text = &mut rest[entry];
+            let found = (cursors[entry]..=text.len()).find(|&at| {
+                at <= whole_text.len()
+                    && text.is_char_boundary(at)
+                    && whole_text.is_char_boundary(at)
+                    && whole_text[..at] == text[..at]
+                    && whole_text[at..].starts_with(bytes)
+            });
+            if let Some(at) = found {
+                text.insert_str(at, bytes);
+                cursors[entry] = at + bytes.len();
+                continue 'moved;
+            }
+        }
+        return false;
+    }
+    rest.iter().eq(whole.malformed.iter().map(|(_, text)| text))
+}
+
+#[test]
+fn the_stated_exception_is_told_from_any_other_difference() {
+    let text = r#"{"name": "f", "arguments": "ab\udc00"}"#;
+    let mut whole = Said::default();
+    whole.calls.push((0, "call_1".to_string(), "f".to_string()));
+    whole.arguments.push((0, String::new()));
+    whole.malformed.push((
+        MalformedReason::UnterminatedRegion,
+        r#""ab\udc00""#.to_string(),
+    ));
+    whole.ended.push(0);
+    let mut cut = whole.clone();
+    cut.arguments[0].1 = r#""ab\udc0"#.to_string();
+    cut.malformed[0].1 = r#"0""#.to_string();
+    assert!(is_the_stated_exception(text, &whole, &cut));
+    assert!(
+        !is_the_stated_exception(r#"{"name": "f", "arguments": "ab"}"#, &whole, &cut),
+        "no broken escape in the output"
+    );
+    let mut other = cut.clone();
+    other.content.push('x');
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "content differs"
+    );
+    let mut other = cut.clone();
+    other.malformed[0].1.push('"');
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "a byte invented"
+    );
+    let mut other = cut.clone();
+    other.arguments[0].1 = r"[ab\udc0".to_string();
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "not a top-level string, the bytes balancing"
+    );
+    let mut other = cut.clone();
+    other.malformed[0].0 = MalformedReason::InvalidArguments;
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "a reason re-judged"
+    );
+    let mut other = cut.clone();
+    other.arguments[0].1 = r#""zb\udc0"#.to_string();
+    assert!(
+        !is_the_stated_exception(text, &whole, &other),
+        "a byte changed, the count the same"
+    );
+    // A byte that crossed a reason: the closing quote moved from one entry to the next.
+    let mut whole_two = whole.clone();
+    whole_two.malformed[0].0 = MalformedReason::InvalidArguments;
+    whole_two
+        .malformed
+        .push((MalformedReason::UnterminatedRegion, "q".to_string()));
+    let mut cut_two = cut.clone();
+    cut_two.malformed[0] = (MalformedReason::InvalidArguments, "0".to_string());
+    cut_two
+        .malformed
+        .push((MalformedReason::UnterminatedRegion, r#""q"#.to_string()));
+    assert!(
+        !is_the_stated_exception(text, &whole_two, &cut_two),
+        "a byte crossed a reason"
+    );
+    // Two calls cut alike: the second call's bytes go back after the first's.
+    let text_two =
+        r#"{"name": "f", "arguments": "ab\udc00"}{"name": "f", "arguments": "ab\udc00"}"#;
+    let mut whole_two = whole.clone();
+    whole_two
+        .calls
+        .push((1, "call_2".to_string(), "f".to_string()));
+    whole_two.arguments.push((1, String::new()));
+    whole_two.malformed[0].1 = r#""ab\udc00""ab\udc00""#.to_string();
+    whole_two.ended.push(1);
+    let mut cut_two = whole_two.clone();
+    cut_two.arguments[0].1 = r#""ab\udc0"#.to_string();
+    cut_two.arguments[1].1 = r#""ab\udc0"#.to_string();
+    cut_two.malformed[0].1 = r#"0"0""#.to_string();
+    assert!(
+        is_the_stated_exception(text_two, &whole_two, &cut_two),
+        "two calls cut alike"
+    );
+    assert!(
+        !is_the_stated_exception(text, &whole, &whole),
+        "no difference at all"
+    );
+}
 
 /// Whether `text` holds a JSON surrogate escape that is broken: a high surrogate (`\ud800` to
 /// `\udbff`) not followed by a low one (`\udc00` to `\udfff`), or a low one not preceded by a
-/// high one. An escape begins at a backslash that is not itself escaped; an escape cut short
-/// (the tail cut mid-escape) is not a broken one, as whole and pieces hold it alike.
+/// high one. An escape begins at a backslash that is not itself escaped. An escape the text ends
+/// in the middle of (the tail cut after `\ud83c\`, or inside `\ude0`) is not a broken one: the
+/// parser reads it as a valid prefix, whole and pieces alike.
 fn holds_a_broken_surrogate_escape(text: &str) -> bool {
     let bytes = text.as_bytes();
+    // `\`, `\u`, `\u` + up to three hex digits, ending the text: an escape cut short.
+    let cut_short_at = |at: usize| -> bool {
+        let rest = &bytes[at..];
+        rest.first() == Some(&b'\\')
+            && rest.len() <= 5
+            && (rest.len() == 1 || (rest[1] == b'u' && rest[2..].iter().all(u8::is_ascii_hexdigit)))
+    };
     let escape_at = |at: usize| -> Option<u32> {
         // `\uXXXX` at `at`, the backslash unescaped: its code unit.
         if bytes.get(at) != Some(&b'\\') || bytes.get(at + 1) != Some(&b'u') {
@@ -795,7 +967,7 @@ fn holds_a_broken_surrogate_escape(text: &str) -> bool {
             }
             None => {
                 if after_high {
-                    return true;
+                    return !cut_short_at(at);
                 }
                 at += 1;
             }
@@ -814,8 +986,13 @@ fn a_broken_surrogate_escape_is_told_from_a_whole_one() {
         r"\u00e9 \n \\",
         r"\ud83",
         r"ab\udc0",
-        // A high escape the text ends on: cut short, held alike by whole and pieces.
+        // A high escape the text ends on, or an escape the text ends in the middle of: cut
+        // short, read as a valid prefix by whole and pieces alike.
         r"\ud83c",
+        r"\ud83c\",
+        r"\ud83c\u",
+        r"\ud83c\ude0",
+        r#"{"e": "\ud83c\"#,
     ] {
         assert!(!holds_a_broken_surrogate_escape(whole), "{whole:?}");
     }
@@ -832,6 +1009,7 @@ fn a_broken_surrogate_escape_is_told_from_a_whole_one() {
     }
 }
 
+/// The scrambles of one subject, each in its own seed: the failures, each naming what replays it.
 fn scramble(
     table: Table,
     variant: Variant,
@@ -855,11 +1033,6 @@ fn scramble(
         );
         let prompt_text = prompt(&mut random, &format);
         let text = output(&mut random, &vocabulary);
-        // The stated exception (see the module doc) stays out of the outputs.
-        if holds_a_broken_surrogate_escape(&text) {
-            SKIPPED.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
         let finish = finish(&mut random);
         let outcome = catch_unwind(AssertUnwindSafe(|| {
             check(
@@ -928,11 +1101,12 @@ fn every_table_reads_every_scramble_without_a_panic_and_keeps_the_contract() {
             })
             .collect()
     });
-    let skipped = SKIPPED.load(Ordering::Relaxed) as u64;
+    let forgiven = FORGIVEN.load(Ordering::Relaxed);
     println!(
-        "{} scrambles read: {} tables x {} variants x 2 declarations x {cases} seeds from {first}, \
-         {skipped} skipped for a broken surrogate escape (the stated exception)",
-        subjects.len() as u64 * cases - skipped,
+        "{} scrambles read: {} tables x {} variants x 2 declarations x {cases} seeds from {first}; \
+         {forgiven} differences forgiven as the stated exception (a broken surrogate escape in a \
+         top-level string)",
+        subjects.len() as u64 * cases,
         Table::ALL.len(),
         Variant::ALL.len()
     );
