@@ -2623,6 +2623,60 @@ fn m3_a_hub_of_thousands_of_definitions_is_walked_within_the_budget() {
     );
 }
 
+/// A hub of 6,300 one-word definitions whose closure sits just past the byte budget, reached by
+/// 1,023 number leaves written inline, each its own schema, and a plain integer after them: a
+/// refused walk spends none of the leaves' budget, so the walks have an allowance of their own,
+/// the leaves after it are free text without a walk, and the integer, which walks nothing, is a
+/// fragment still.
+#[test]
+fn m3_distinct_leaves_at_a_hub_past_the_budget_stop_walking() {
+    let mut defs = serde_json::Map::new();
+    let branches: Vec<serde_json::Value> = (0..6300)
+        .map(|i| {
+            defs.insert(format!("d{i:05}"), json!({"type": "string"}));
+            json!({"$ref": format!("#/$defs/d{i:05}")})
+        })
+        .collect();
+    defs.insert("Hub".to_string(), json!({"anyOf": branches}));
+    let mut root: serde_json::Map<String, serde_json::Value> = (0..1023)
+        .map(|i| {
+            (
+                format!("n{i:04}"),
+                json!({"type": "number", "not": {"$ref": "#/$defs/Hub"}}),
+            )
+        })
+        .collect();
+    root.insert(
+        "plain".to_string(),
+        json!({"type": "integer", "minimum": 0}),
+    );
+    let required: Vec<String> = root.keys().cloned().collect();
+    let tool = schema_tool(json!({
+        "type": "object",
+        "$defs": defs,
+        "properties": root,
+        "required": required,
+    }));
+    let started = std::time::Instant::now();
+    let tag = MinimaxM3Parser::build_structural_tag(&[tool], true);
+    let took = started.elapsed();
+    let text = serde_json::to_string(&tag).unwrap();
+    assert!(text.len() < 400_000, "{} bytes", text.len());
+    assert_eq!(elements_written(&tag), 1024);
+    let leaves = fragments(&tag);
+    assert_eq!(leaves.len(), 1, "the plain integer's fragment alone");
+    assert_eq!(leaves[0]["type"], "integer");
+    assert!(
+        free_text_runs(&tag) >= 1000,
+        "{} free-text runs",
+        free_text_runs(&tag)
+    );
+    assert!(
+        took.as_secs() < 5,
+        "an allowance bounds the refused walks: {took:?}"
+    );
+}
+
 /// A list's item element counts against the budget like a property's; a list reached once the
 /// budget is spent is free text.
 #[test]
